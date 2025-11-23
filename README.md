@@ -1,55 +1,114 @@
-# Real-ESRGAN API
+# Real-ESRGAN API (GPU-Enabled)
 
+A FastAPI-based API wrapper around **Real-ESRGAN**, packaged in Docker with full **NVIDIA GPU support** and optimized for in-memory image processing.
+
+This fork includes several reliability improvements, including:
+- proper CUDA-enabled PyTorch installation
+- GPU device detection at runtime
+- in-memory processing (no temporary files)
+- simplified `/upscale/` endpoint
+- correct multipart form field usage (`file=`)
+
+Upstream Real-ESRGAN project:
 https://github.com/xinntao/Real-ESRGAN
+
+---
 
 ## 🚀 Getting Started
 
 ### 🛠 Build the Docker Image
 
-To build the Docker image, run the following command:
-
 ```sh
-# BUILD
 docker build -t real-esrgan-api .
 ```
 
-### ▶️ Run the API
+### ▶️ Run the API with NVIDIA GPU Support
 
-Once built, you can run the API using:
+Make sure you have installed:
+
+- NVIDIA drivers
+- `nvidia-container-toolkit`
+- Docker configured for GPU passthrough (`--gpus all`)
+
+Run the container:
 
 ```sh
-# RUN
-docker run -p 8000:8000 real-esrgan-api
+docker run -d --gpus all -p 8000:8000 --name realesrgan real-esrgan-api
 ```
 
-This will start the API and expose it on port **8000**.
+### ▶️ Or Use Docker Compose
+
+```sh
+docker compose up -d --build
+```
+
+This will start the API and expose it on **http://localhost:8000**.
+
+---
 
 ## 🔗 API Endpoint
 
-After running the container, the API will be accessible at:
+The upscaling endpoint is:
 
 ```
-http://localhost:8000
+POST http://localhost:8000/upscale/
 ```
 
-### Example Usage
+### 📤 Example Request
 
-You can send a **POST request** with an image to process:
+Note: the form field must be named **`file`** (not `image`).
 
 ```sh
-curl -X POST -F "image=@path/to/image.jpg" http://localhost:8000/upscale
+curl -X POST \
+     -F "file=@path/to/image.jpg" \
+     -o output.png \
+     http://localhost:8000/upscale/
 ```
 
-This will return an enhanced version of the input image.
+The API returns a PNG-formatted upscaled image.
+
+### Optional Parameters
+
+You can adjust upscale factor:
+
+```sh
+curl -X POST \
+     -F "file=@input.jpg" \
+     -F "outscale=4" \
+     -o output.png \
+     http://localhost:8000/upscale/
+```
+
+Default is **2×**.
+
+---
+
+## 🧠 How It Works
+
+- The Real-ESRGAN model is loaded once on startup.
+- If a GPU is available, the model runs on CUDA with half-precision.
+- Uploads are decoded in memory (no temp files).
+- Results are returned as a streaming PNG response.
+
+This avoids issues with deleted temp files and is much faster.
+
+---
+
+## 🛠 Requirements
+
+- Docker
+- NVIDIA GPU
+- NVIDIA container toolkit (`nvidia-ctk`)
+- CUDA-supported GPU drivers
+- Internet access for initial model download (or place your own `.pth` model in `/Real-ESRGAN/weights/`)
+
+---
 
 ## 📸 Preview
 
 ![Real-ESRGAN API Preview](https://github.com/natnael9402/real-esrgan-api/blob/main/1.png)
 
-## 🛠 Requirements
-
-- Docker installed on your machine
-- A valid Real-ESRGAN model inside the API
+---
 
 ## 📝 License
 
@@ -57,7 +116,6 @@ This project is licensed under the MIT License.
 
 ---
 
-Made with ❤️ by **Natnael**
+Made with ❤️
 
-
-
+Forked & enhanced for GPU support and in-memory processing

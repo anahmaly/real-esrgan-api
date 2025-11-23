@@ -1,0 +1,19 @@
+services:
+  realesrgan:
+    container_name: realesrgan
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+    # GPU support (equivalent to --gpus all)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+
+    # If your Docker Compose version supports the `gpus:` key directly (Compose v2+)
+    gpus: all
