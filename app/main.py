@@ -1,4 +1,6 @@
+import gc
 import io
+
 import cv2
 import numpy as np
 import torch
@@ -45,6 +47,12 @@ async def upscale_image(
     file: UploadFile = File(...),
     outscale: float = 2.0,  # default 2x; you can send 4.0, etc.
 ):
+    data = None
+    nparr = None
+    img = None
+    output = None
+    buf = None
+
     try:
         data = await file.read()
         if not data:
@@ -56,16 +64,18 @@ async def upscale_image(
         if img is None:
             raise HTTPException(status_code=400, detail="Could not decode image")
 
-        # Run Real-ESRGAN
-        output, _ = upsampler.enhance(img, outscale=outscale)
+        # Run Real-ESRGAN without autograd graph allocation
+        with torch.inference_mode():
+            output, _ = upsampler.enhance(img, outscale=outscale)
 
         # Encode result to PNG bytes
         ok, buf = cv2.imencode(".png", output)
         if not ok:
             raise HTTPException(status_code=500, detail="Failed to encode output image")
 
+        result_bytes = buf.tobytes()
         return StreamingResponse(
-            io.BytesIO(buf.tobytes()),
+            io.BytesIO(result_bytes),
             media_type="image/png",
         )
 
@@ -75,3 +85,10 @@ async def upscale_image(
         # Shows up in container logs
         print("Upscale error:", repr(e))
         raise HTTPException(status_code=500, detail="Upscale failed internally")
+    finally:
+        # Release large arrays/tensors quickly between requests.
+        del data, nparr, img, output, buf
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
