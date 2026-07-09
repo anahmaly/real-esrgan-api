@@ -78,13 +78,13 @@ async def upscale_image(
         # RealESRGANer stores tile size on the instance, so protect per-request
         # tile changes from concurrent requests sharing the global upsampler.
         async with upsampler_lock:
-            previous_tile = upsampler.tile
-            upsampler.tile = tile
+            previous_tile_size = upsampler.tile_size
+            upsampler.tile_size = tile
             try:
                 with torch.inference_mode():
                     output, _ = upsampler.enhance(img, outscale=outscale)
             finally:
-                upsampler.tile = previous_tile
+                upsampler.tile_size = previous_tile_size
 
         # Encode result to PNG bytes
         ok, buf = cv2.imencode(".png", output)
