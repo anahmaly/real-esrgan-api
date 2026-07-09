@@ -70,8 +70,57 @@ def test_endpoint_exposes_validated_tile_query_parameter():
 def test_endpoint_serializes_per_request_tile_mutation():
     assert "upsampler_lock = asyncio.Lock()" in MAIN_SOURCE
     assert "async with upsampler_lock:" in MAIN_SOURCE
-    assert "upsampler.tile = tile" in MAIN_SOURCE
-    assert "upsampler.tile = previous_tile" in MAIN_SOURCE
+    assert "previous_tile_size = upsampler.tile_size" in MAIN_SOURCE
+    assert "upsampler.tile_size = tile" in MAIN_SOURCE
+    assert "upsampler.tile_size = previous_tile_size" in MAIN_SOURCE
+    assert "upsampler.tile =" not in MAIN_SOURCE
+
+
+def test_endpoint_mutates_realesrganer_tile_size_contract_in_finally():
+    endpoint = next(
+        node
+        for node in MAIN_TREE.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "upscale_image"
+    )
+
+    tile_size_assignments = []
+    restore_in_finally = False
+    legacy_tile_assignments = []
+
+    for node in ast.walk(endpoint):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "upsampler"
+                ):
+                    if target.attr == "tile_size":
+                        tile_size_assignments.append(node)
+                    if target.attr == "tile":
+                        legacy_tile_assignments.append(node)
+
+        if isinstance(node, ast.Try):
+            for finalizer_node in node.finalbody:
+                if not isinstance(finalizer_node, ast.Assign):
+                    continue
+                for target in finalizer_node.targets:
+                    if (
+                        isinstance(target, ast.Attribute)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "upsampler"
+                        and target.attr == "tile_size"
+                        and isinstance(finalizer_node.value, ast.Name)
+                        and finalizer_node.value.id == "previous_tile_size"
+                    ):
+                        restore_in_finally = True
+
+    assert not legacy_tile_assignments
+    assert any(
+        isinstance(node.value, ast.Name) and node.value.id == "tile"
+        for node in tile_size_assignments
+    )
+    assert restore_in_finally
 
 
 def test_readme_documents_query_parameters_and_tiling_guidance():
