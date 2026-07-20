@@ -7,33 +7,50 @@ COMPOSE = (ROOT / "compose.yml").read_text()
 MAIN = (ROOT / "app" / "main.py").read_text()
 
 
-def _realesrgan_dependency_install_block():
+def _step_six_run_instruction():
     marker = "# 6. Install Real-ESRGAN deps"
     start = DOCKERFILE.index(marker)
     end = DOCKERFILE.index("# 7. Copy API code", start)
-    return DOCKERFILE[start:end]
+    step_lines = DOCKERFILE[start:end].splitlines()
+    run_starts = [
+        index
+        for index, line in enumerate(step_lines)
+        if line.lstrip().startswith("RUN ")
+    ]
+    assert len(run_starts) == 1
+
+    command_lines = []
+    continued = False
+    for line in step_lines[run_starts[0] :]:
+        stripped = line.strip()
+        if stripped == "# install headless OpenCV explicitly":
+            assert continued
+            continue
+        if command_lines and not continued:
+            break
+
+        continued = stripped.endswith("\\")
+        command_lines.append(stripped.removesuffix("\\").rstrip())
+
+    assert command_lines[0].startswith("RUN ")
+    return " ".join(command_lines)[len("RUN ") :]
 
 
-def test_lmdb_build_toolchain_is_transient_and_ordered_around_source_installs():
-    install_block = _realesrgan_dependency_install_block()
+def test_lmdb_build_toolchain_is_one_fail_closed_run_chain():
+    expected_commands = [
+        "apt-get update",
+        "apt-get install -y --no-install-recommends build-essential",
+        "sed -i '/torch/d' requirements.txt",
+        "sed -i '/opencv-python/d' requirements.txt",
+        "pip install --no-cache-dir basicsr==1.4.2 facexlib==0.2.5 gfpgan==1.3.8",
+        "pip install --no-cache-dir -r requirements.txt",
+        "pip install --no-cache-dir opencv-python-headless",
+        "python setup.py develop",
+        "apt-get purge -y --auto-remove build-essential",
+        "rm -rf /var/lib/apt/lists/*",
+    ]
 
-    apt_update = install_block.index("apt-get update")
-    toolchain_install = install_block.index(
-        "apt-get install -y --no-install-recommends build-essential"
-    )
-    first_lmdb_capable_pip = install_block.index(
-        "pip install --no-cache-dir basicsr==1.4.2"
-    )
-    setup_develop = install_block.index("python setup.py develop")
-    toolchain_purge = install_block.index(
-        "apt-get purge -y --auto-remove build-essential"
-    )
-    apt_lists_cleanup = install_block.index("rm -rf /var/lib/apt/lists/*")
-
-    assert apt_update < toolchain_install < first_lmdb_capable_pip
-    assert first_lmdb_capable_pip < setup_develop < toolchain_purge
-    assert toolchain_purge < apt_lists_cleanup
-    assert "python setup.py develop && \\\n    apt-get purge" in install_block
+    assert _step_six_run_instruction() == " && ".join(expected_commands)
 
 
 def test_official_model_weight_urls_and_destinations_are_unchanged():
