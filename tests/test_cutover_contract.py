@@ -69,6 +69,29 @@ def test_pinned_upstream_sources_and_no_weight_download_commands() -> None:
     assert "hf auth" not in dockerfiles.lower()
 
 
+def test_background_install_pins_birefnet_runtime_dependency() -> None:
+    dockerfiles = list(ROOT.glob("Dockerfile*"))
+    background = (ROOT / "Dockerfile.background").read_text().replace("\\\n", " ")
+    install_line = next(
+        line.removeprefix("RUN ")
+        for line in background.splitlines()
+        if line.startswith("RUN ") and "rembg-api.git" in line
+    )
+    tokens = shlex.split(install_line)
+
+    einops_tokens = [token for token in tokens if token.lower().startswith("einops")]
+    assert einops_tokens == ["einops==0.8.2"]
+    assert (
+        "git+https://github.com/anahmaly/rembg-api.git@dd7b6fd434cff2077ce6e9a0cab46fe254f26f1f"
+    ) in tokens
+    assert "--break-system-packages" not in background
+    assert all(
+        "einops" not in path.read_text().lower()
+        for path in dockerfiles
+        if path.name != "Dockerfile.background"
+    )
+
+
 def test_generation_install_handles_pep_668_and_keeps_ideogram_pinned() -> None:
     dockerfiles = list(ROOT.glob("Dockerfile*"))
     generation = (ROOT / "Dockerfile.generation").read_text().replace("\\\n", " ")
