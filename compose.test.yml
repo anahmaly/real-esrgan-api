@@ -2,6 +2,7 @@ services:
   image-api:
     environment:
       IMAGE_API_CUDA_AVAILABLE: "false"
+      IMAGE_API_GENERATION_TEST_MODE: "true"
   upscale-worker:
     image: image-api-test-worker:local
     build:

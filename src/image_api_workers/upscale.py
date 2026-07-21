@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import gc
 import io
 import logging
 import os
+import threading
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -13,6 +15,7 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
 
 logger = logging.getLogger(__name__)
@@ -21,6 +24,7 @@ MODELS = {
     "RealESRGAN_x4plus_anime_6B": (6, "RealESRGAN_x4plus_anime_6B.pth"),
 }
 _loaded_model_name: str | None = None
+_model_lock = threading.RLock()
 
 
 def _weights_dir() -> Path:
@@ -33,7 +37,11 @@ def _runtime_status() -> dict[str, object]:
         import torch
 
         cuda = bool(torch.cuda.is_available())
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "upscale CUDA runtime probe failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         cuda = False
     return {
         "ready": available and cuda,
@@ -74,28 +82,59 @@ def _load_model(model_name: str) -> Any:
     return backend
 
 
-def _release_model_for_transition(requested_model: str) -> None:
+def _release_resident_model() -> None:
     global _loaded_model_name
+    with _model_lock:
+        _load_model.cache_clear()
+        _loaded_model_name = None
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+                if callable(ipc_collect):
+                    ipc_collect()
+        except ImportError:
+            pass
+        except (AttributeError, RuntimeError) as exc:
+            logger.exception("upscale CUDA cache release failed")
+            raise RuntimeError("upscale CUDA cache release failed") from exc
+
+
+def _release_model_for_transition(requested_model: str) -> None:
     if _loaded_model_name is None or _loaded_model_name == requested_model:
         return
-    _load_model.cache_clear()
-    _loaded_model_name = None
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
+    _release_resident_model()
 
 
 app = FastAPI(title="image-api-upscale-worker", docs_url=None, redoc_url=None)
 
 
+def _shutdown_unload() -> None:
+    try:
+        _release_resident_model()
+    except Exception:
+        logger.exception("upscale worker shutdown unload failed")
+
+
+atexit.register(_shutdown_unload)
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return _runtime_status()
+
+
+@app.post("/internal/unload")
+def unload() -> dict[str, object]:
+    try:
+        _release_resident_model()
+    except Exception as exc:
+        logger.exception("upscale worker unload failed")
+        raise HTTPException(500, "model unload failed") from exc
+    return {"unloaded": True, "loaded": False}
 
 
 def _run_upscale(data: bytes, *, model: str, outscale: float, tile: int) -> bytes:
@@ -138,10 +177,21 @@ async def upscale(
     data = await file.read()
     await file.close()
     try:
+
+        def operation() -> bytes:
+            PeerEvictor(
+                (
+                    os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
+                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+                )
+            )()
+            with _model_lock:
+                return _run_upscale(data, model=model, outscale=outscale, tile=tile)
+
         encoded = await asyncio.to_thread(
             execute_in_gpu_lane,
             "upscale",
-            lambda: _run_upscale(data, model=model, outscale=outscale, tile=tile),
+            operation,
         )
         return Response(encoded, media_type="image/png")
     except Exception as exc:

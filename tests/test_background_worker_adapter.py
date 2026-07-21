@@ -16,6 +16,7 @@ app = background.app
 
 
 def _install_pr7_fakes(monkeypatch, calls: list[tuple[str, dict[str, object]]]) -> None:
+    monkeypatch.setattr(background, "PeerEvictor", lambda _peers: lambda: None)
     package = ModuleType("rembg_api")
     package.__path__ = []  # type: ignore[attr-defined]
 

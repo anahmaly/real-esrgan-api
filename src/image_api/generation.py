@@ -15,8 +15,20 @@ from image_api.store import TaskStore
 logger = logging.getLogger(__name__)
 GenerationModel = Callable[[dict[str, object]], bytes]
 FailureInjector = Callable[[str], None]
+PeerEvictor = Callable[[], None]
 GENERATION_MAX_ENCODED_BYTES = 100_000_000
+GENERATION_MAX_OUTPUT_PIXELS = 80_000_000
 GENERATION_OUTPUT_MODE = "RGB"
+
+
+def _expected_output(request: dict[str, object]) -> tuple[int, int] | None:
+    if request.get("task_type") == "image-edit":
+        return None
+    width = request.get("width")
+    height = request.get("height")
+    if type(width) is not int or type(height) is not int:
+        raise ValueError("invalid persisted generation dimensions")
+    return (width, height)
 
 
 def write_worker_heartbeat(path: Path) -> None:
@@ -83,12 +95,15 @@ def reconcile_task_output(store: TaskStore, task_id: str, output_dir: Path) -> b
     try:
         with final_path.open("rb") as handle:
             encoded = handle.read(GENERATION_MAX_ENCODED_BYTES + 1)
+        expected = _expected_output(task.request)
         validate_png_output(
             encoded,
-            expected_size=(int(task.request["width"]), int(task.request["height"])),
+            expected_size=expected,
             required_mode=GENERATION_OUTPUT_MODE,
             max_bytes=GENERATION_MAX_ENCODED_BYTES,
-            max_pixels=int(task.request["width"]) * int(task.request["height"]),
+            max_pixels=(
+                expected[0] * expected[1] if expected is not None else GENERATION_MAX_OUTPUT_PIXELS
+            ),
         )
         valid = True
     except (OSError, KeyError, TypeError, ValueError, RuntimeError):
@@ -119,6 +134,7 @@ class GenerationRunner:
         model: GenerationModel,
         worker_id: str | None = None,
         failure_injector: FailureInjector | None = None,
+        peer_evictor: PeerEvictor | None = None,
     ) -> None:
         self.store = store
         self.lane = lane
@@ -126,6 +142,7 @@ class GenerationRunner:
         self.model = model
         self.worker_id = worker_id or f"generation-{uuid.uuid4().hex[:12]}"
         self.failure_injector = failure_injector
+        self.peer_evictor = peer_evictor
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
     def run_one(self) -> bool:
@@ -134,14 +151,20 @@ class GenerationRunner:
             return False
         try:
             with self.lane.acquire("generation"):
+                if self.peer_evictor is not None:
+                    self.peer_evictor()
                 encoded = self.model(task.request)
-            expected = (int(task.request["width"]), int(task.request["height"]))
+            expected = _expected_output(task.request)
             validate_png_output(
                 encoded,
                 expected_size=expected,
                 required_mode=GENERATION_OUTPUT_MODE,
                 max_bytes=GENERATION_MAX_ENCODED_BYTES,
-                max_pixels=expected[0] * expected[1],
+                max_pixels=(
+                    expected[0] * expected[1]
+                    if expected is not None
+                    else GENERATION_MAX_OUTPUT_PIXELS
+                ),
             )
             image_name = f"{task.task_id}.png"
             final_path = self.output_dir / image_name

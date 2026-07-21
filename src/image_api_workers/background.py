@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import atexit
 import gc
 import io
 import logging
 import os
+import threading
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -12,10 +14,12 @@ from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
+from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
 
 logger = logging.getLogger(__name__)
 _active_model: str | None = None
+_model_lock = threading.RLock()
 
 
 def _birefnet_config() -> Any:
@@ -37,27 +41,43 @@ def _birefnet_config() -> Any:
 
 def _release_resident_models() -> None:
     global _active_model
-    try:
-        from rembg_api.birefnet_hr import clear_cache
+    with _model_lock:
+        release_errors: list[BaseException] = []
+        try:
+            from rembg_api.birefnet_hr import clear_cache
 
-        clear_cache()
-    except Exception:
-        pass
-    try:
-        from rembg_api.bria_rmbg import clear_bria_backend_cache
+            clear_cache()
+        except ImportError:
+            pass
+        except (AttributeError, RuntimeError) as exc:
+            release_errors.append(exc)
+            logger.exception("BiRefNet cache release failed")
+        try:
+            from rembg_api.bria_rmbg import clear_bria_backend_cache
 
-        clear_bria_backend_cache(release_cuda_cache=True)
-    except Exception:
-        pass
-    gc.collect()
-    try:
-        import torch
+            clear_bria_backend_cache(release_cuda_cache=True)
+        except ImportError:
+            pass
+        except (AttributeError, RuntimeError) as exc:
+            release_errors.append(exc)
+            logger.exception("BRIA cache release failed")
+        gc.collect()
+        try:
+            import torch
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-    _active_model = None
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+                if callable(ipc_collect):
+                    ipc_collect()
+        except ImportError:
+            pass
+        except (AttributeError, RuntimeError) as exc:
+            release_errors.append(exc)
+            logger.exception("background CUDA cache release failed")
+        _active_model = None
+        if release_errors:
+            raise RuntimeError("background model release failed") from release_errors[0]
 
 
 def _run_background(
@@ -133,7 +153,11 @@ def _health() -> dict[str, object]:
         import torch
 
         cuda = bool(torch.cuda.is_available())
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "background CUDA runtime probe failed",
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
         cuda = False
     loaded = _active_model is not None
     mounts = bria.is_dir() and birefnet.is_dir()
@@ -149,9 +173,29 @@ def _health() -> dict[str, object]:
 app = FastAPI(title="image-api-background-worker", docs_url=None, redoc_url=None)
 
 
+def _shutdown_unload() -> None:
+    try:
+        _release_resident_models()
+    except Exception:
+        logger.exception("background worker shutdown unload failed")
+
+
+atexit.register(_shutdown_unload)
+
+
 @app.get("/health")
 def health() -> dict[str, object]:
     return _health()
+
+
+@app.post("/internal/unload")
+def unload() -> dict[str, object]:
+    try:
+        _release_resident_models()
+    except Exception as exc:
+        logger.exception("background worker unload failed")
+        raise HTTPException(500, "model unload failed") from exc
+    return {"unloaded": True, "loaded": False}
 
 
 @app.post("/internal/background-removal", response_class=Response)
@@ -172,20 +216,31 @@ async def remove_background(
     data = await file.read()
     await file.close()
     try:
+
+        def operation() -> bytes:
+            PeerEvictor(
+                (
+                    os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
+                    os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+                )
+            )()
+            with _model_lock:
+                return _run_background(
+                    data,
+                    model=model,
+                    alpha_blur=alpha_blur,
+                    alpha_erode=alpha_erode,
+                    alpha_dilate=alpha_dilate,
+                    alpha_threshold=alpha_threshold,
+                    birefnet_inference_size=birefnet_inference_size,
+                    birefnet_foreground_refinement=birefnet_foreground_refinement,
+                    model_input_size=model_input_size,
+                )
+
         encoded = await asyncio.to_thread(
             execute_in_gpu_lane,
             "background-removal",
-            lambda: _run_background(
-                data,
-                model=model,
-                alpha_blur=alpha_blur,
-                alpha_erode=alpha_erode,
-                alpha_dilate=alpha_dilate,
-                alpha_threshold=alpha_threshold,
-                birefnet_inference_size=birefnet_inference_size,
-                birefnet_foreground_refinement=birefnet_foreground_refinement,
-                model_input_size=model_input_size,
-            ),
+            operation,
         )
         return Response(encoded, media_type="image/png")
     except Exception as exc:

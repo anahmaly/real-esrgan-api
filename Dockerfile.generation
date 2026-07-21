@@ -1,4 +1,4 @@
-FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime
+FROM pytorch/pytorch:2.11.0-cuda12.8-cudnn9-runtime@sha256:eee11b3b3872a8c838e35ef48f08b2d5def2080902c7f666831310ca1a0ef2be
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1
 RUN apt-get update && apt-get install -y --no-install-recommends git && rm -rf /var/lib/apt/lists/*
@@ -7,5 +7,12 @@ COPY pyproject.toml README.md LICENSE NOTICE.md ./
 COPY licenses ./licenses
 COPY src ./src
 RUN python -m pip install --break-system-packages --no-cache-dir . \
+    "torch==2.11.0" \
+    "torchvision==0.26.0" \
+    "diffusers==0.37.0" \
+    "transformers==4.57.1" \
+    "accelerate==1.11.0" \
+    "safetensors==0.6.2" \
     "git+https://github.com/ideogram-oss/ideogram4.git@990fe1c4e950bb9e9dc90e01c0ad98ba434f83c2"
+RUN python -c "import accelerate, diffusers, ideogram4, torch, transformers; from diffusers import LongCatImageEditPipeline; assert torch.__version__.startswith('2.11.0')"
 CMD ["python", "-m", "image_api_workers.generation_worker"]

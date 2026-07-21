@@ -64,16 +64,17 @@ def validate_image(
 def validate_png_output(
     data: bytes,
     *,
-    expected_size: tuple[int, int],
+    expected_size: tuple[int, int] | None,
     required_mode: str | None,
     max_bytes: int,
     max_pixels: int,
 ) -> None:
+    maximum_size = expected_size or (max_pixels, max_pixels)
     info = validate_image(
         data,
         max_bytes=max_bytes,
-        max_width=expected_size[0],
-        max_height=expected_size[1],
+        max_width=maximum_size[0],
+        max_height=maximum_size[1],
         max_pixels=max_pixels,
         worker_output=True,
     )
@@ -82,7 +83,9 @@ def validate_png_output(
             image_format = image.format
     except Exception as exc:
         raise InvalidWorkerImage("worker output is invalid") from exc
-    if image_format != "PNG" or (info.width, info.height) != expected_size:
+    if image_format != "PNG" or (
+        expected_size is not None and (info.width, info.height) != expected_size
+    ):
         raise InvalidWorkerImage("worker output contract mismatch")
     if required_mode is not None and info.mode != required_mode:
         raise InvalidWorkerImage("worker output mode mismatch")

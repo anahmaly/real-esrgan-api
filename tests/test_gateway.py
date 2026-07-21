@@ -36,6 +36,7 @@ def test_health_and_models_do_not_load_models(client: TestClient, worker: FakeWo
         "upscale",
         "background-removal",
         "generation",
+        "image-editing",
     }
     assert [
         item["model"]

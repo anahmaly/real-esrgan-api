@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import gc
 import json
+import logging
 import os
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
 from image_api.config import ideogram_weights_available
+
+logger = logging.getLogger(__name__)
 
 
 class IdeogramRuntimeUnavailable(RuntimeError):
@@ -31,6 +36,7 @@ class IdeogramModel:
         self._cuda_available = cuda_available
         self._status_path = status_path
         self._pipeline: Any | None = None
+        self._lock = threading.RLock()
 
     def _write_status(self, state: str) -> None:
         if self._status_path is None:
@@ -77,13 +83,17 @@ class IdeogramModel:
                 device="cuda",
                 dtype=torch.bfloat16,
             )
-        except Exception:
+        except Exception as exc:
             self._write_status("unloaded")
+            logger.error(
+                "Ideogram runtime initialization failed",
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
             raise IdeogramRuntimeUnavailable("Ideogram runtime initialization failed") from None
         self._write_status("loaded")
         return self._pipeline
 
-    def __call__(self, request: dict[str, object]) -> bytes:
+    def _run(self, request: dict[str, object]) -> bytes:
         width = request.get("width")
         height = request.get("height")
         seed = request.get("seed")
@@ -134,7 +144,12 @@ class IdeogramModel:
                     plain_prompt,
                     aspect_ratio=aspect_ratio_from_size(width, height),
                 )
-            except Exception:
+            except Exception as exc:
+                logger.error(
+                    "Ideogram magic prompt expansion failed: backend=%s",
+                    backend,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
                 raise IdeogramRuntimeUnavailable("magic prompt expansion failed") from None
             if not prompt:
                 raise IdeogramRuntimeUnavailable("magic prompt expansion failed")
@@ -153,10 +168,68 @@ class IdeogramModel:
                 seed=seed,
                 raise_on_caption_issues=True,
             )
-        except Exception:
+        except Exception as exc:
+            logger.error(
+                "Ideogram inference failed: preset=%s dimensions=%sx%s",
+                preset_name,
+                width,
+                height,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
             raise IdeogramRuntimeUnavailable("Ideogram inference failed") from None
         from io import BytesIO
 
         output = BytesIO()
         images[0].save(output, "PNG")
         return output.getvalue()
+
+    def __call__(self, request: dict[str, object]) -> bytes:
+        with self._lock:
+            return self._run(request)
+
+    def unload(self) -> None:
+        with self._lock:
+            pipeline = self._pipeline
+            self._pipeline = None
+            hook_error: Exception | None = None
+            if pipeline is not None:
+                for hook_name in ("remove_all_hooks", "_remove_all_hooks"):
+                    remove_hooks = getattr(pipeline, hook_name, None)
+                    if callable(remove_hooks):
+                        try:
+                            remove_hooks()
+                        except Exception as exc:
+                            hook_error = exc
+                            logger.error(
+                                "Ideogram offload hook removal failed",
+                                exc_info=(type(exc), exc, exc.__traceback__),
+                            )
+                        break
+                del pipeline
+            gc.collect()
+            cuda_error: Exception | None = None
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    ipc_collect = getattr(torch.cuda, "ipc_collect", None)
+                    if callable(ipc_collect):
+                        ipc_collect()
+            except ImportError:
+                pass
+            except (AttributeError, RuntimeError) as exc:
+                cuda_error = exc
+                logger.error(
+                    "Ideogram CUDA cache release failed",
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+            self._write_status("unloaded")
+            if cuda_error is not None:
+                raise RuntimeError("Ideogram CUDA cache release failed") from cuda_error
+            if hook_error is not None:
+                raise RuntimeError("Ideogram offload hook removal failed") from hook_error
+
+    @property
+    def loaded(self) -> bool:
+        return self._pipeline is not None

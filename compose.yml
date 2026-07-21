@@ -12,7 +12,12 @@ services:
       IMAGE_API_STATE_DIR: /state
       IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
       IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
+      IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
       IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
+      IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit
+      IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo
+      IMAGE_API_LONGCAT_EDIT_REVISION: 7b54ef423aa7854be7861600024be5c56ab7875a
+      IMAGE_API_LONGCAT_EDIT_TURBO_REVISION: 6a7262de5549f0bf0ec54c08ef7d283ef41f3214
       IMAGE_API_CUDA_AVAILABLE: "true"
       IMAGE_API_MAX_REQUEST_BYTES: ${IMAGE_API_MAX_REQUEST_BYTES:-21000000}
       IMAGE_API_MAX_UPLOAD_BYTES: ${IMAGE_API_MAX_UPLOAD_BYTES:-20000000}
@@ -23,10 +28,14 @@ services:
     volumes:
       - image-api-state:/state
       - ${IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH:-./models/ideogram-4-nf4}:/models/ideogram-4-nf4:ro
+      - ${IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH:-./models/longcat-image-edit}:/models/longcat-image-edit:ro
+      - ${IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH:-./models/longcat-image-edit-turbo}:/models/longcat-image-edit-turbo:ro
     depends_on:
       upscale-worker:
         condition: service_healthy
       background-worker:
+        condition: service_healthy
+      generation-worker:
         condition: service_healthy
     healthcheck:
       test:
@@ -49,6 +58,8 @@ services:
       - "9001"
     environment:
       IMAGE_API_UPSCALE_WEIGHTS_PATH: /models/upscale
+      IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
+      IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
     volumes:
       - ${IMAGE_API_UPSCALE_WEIGHTS_HOST_PATH:-./models/upscale}:/models/upscale:ro
       - image-api-state:/state
@@ -76,6 +87,8 @@ services:
       IMAGE_API_BRIA_WEIGHTS_PATH: /models/bria-rmbg-2.0
       IMAGE_API_BIREFNET_WEIGHTS_PATH: /models/birefnet-hr
       IMAGE_API_BIREFNET_REVISION: 5d6b6f8adcb5b417c871b1d84ceaae9871355b7f
+      IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
+      IMAGE_API_GENERATION_WORKER_URL: http://generation-worker:9003
     volumes:
       - ${IMAGE_API_BRIA_WEIGHTS_HOST_PATH:-./models/bria-rmbg-2.0}:/models/bria-rmbg-2.0:ro
       - ${IMAGE_API_BIREFNET_WEIGHTS_HOST_PATH:-./models/birefnet-hr}:/models/birefnet-hr:ro
@@ -98,23 +111,34 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.generation
+    expose:
+      - "9003"
     environment:
       IMAGE_API_STATE_DIR: /state
       IMAGE_API_IDEOGRAM_WEIGHTS_PATH: /models/ideogram-4-nf4
       IMAGE_API_IDEOGRAM_REPOSITORY_ID: ideogram-ai/ideogram-4-nf4
+      IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH: /models/longcat-image-edit
+      IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH: /models/longcat-image-edit-turbo
+      IMAGE_API_LONGCAT_EDIT_REVISION: 7b54ef423aa7854be7861600024be5c56ab7875a
+      IMAGE_API_LONGCAT_EDIT_TURBO_REVISION: 6a7262de5549f0bf0ec54c08ef7d283ef41f3214
+      IMAGE_API_UPSCALE_WORKER_URL: http://upscale-worker:9001
+      IMAGE_API_BACKGROUND_WORKER_URL: http://background-worker:9002
+      IMAGE_API_CUDA_AVAILABLE: "true"
       IMAGE_API_MAX_QUEUE_DEPTH: ${IMAGE_API_MAX_QUEUE_DEPTH:-100}
       IMAGE_API_MAGIC_PROMPT_BACKEND: ${IMAGE_API_MAGIC_PROMPT_BACKEND:-}
       IMAGE_API_MAGIC_PROMPT_API_KEY: ${IMAGE_API_MAGIC_PROMPT_API_KEY:-}
     volumes:
       - image-api-state:/state
       - ${IMAGE_API_IDEOGRAM_WEIGHTS_HOST_PATH:-./models/ideogram-4-nf4}:/models/ideogram-4-nf4:ro
+      - ${IMAGE_API_LONGCAT_EDIT_WEIGHTS_HOST_PATH:-./models/longcat-image-edit}:/models/longcat-image-edit:ro
+      - ${IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_HOST_PATH:-./models/longcat-image-edit-turbo}:/models/longcat-image-edit-turbo:ro
     gpus: all
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import os,time; age=time.time()-os.path.getmtime('/state/generation-worker.heartbeat'); raise SystemExit(0 if 0 <= age <= 15 else 1)"
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9003/health', timeout=3)"
       interval: 10s
       timeout: 5s
       retries: 3

@@ -14,6 +14,11 @@ def health() -> dict[str, object]:
     return {"ready": True, "loaded": False, "device": "cpu-test"}
 
 
+@app.post("/internal/unload")
+def unload() -> dict[str, object]:
+    return {"unloaded": True}
+
+
 @app.post("/internal/upscale")
 async def upscale(file: UploadFile, outscale: float, model: str, tile: int) -> Response:
     data = await file.read()

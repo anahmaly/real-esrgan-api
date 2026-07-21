@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import logging
 import os
 import re
+import threading
+import uuid
 from typing import Annotated, Any, Literal, cast
 
-from fastapi import FastAPI, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response
+from PIL import Image
 from pydantic import BaseModel, Field, model_validator
 
-from image_api.config import Settings, ideogram_weights_available
+from image_api.config import Settings, ideogram_weights_available, longcat_weights_available
 from image_api.generation import worker_heartbeat_alive
 from image_api.images import (
     ImageTooLarge,
@@ -28,9 +33,11 @@ logger = logging.getLogger(__name__)
 UPSCALE_MODELS = ("RealESRGAN_x4plus", "RealESRGAN_x4plus_anime_6B")
 BACKGROUND_MODELS = ("bria-rmbg-2.0", "birefnet-hr-matting")
 SAMPLER_PRESETS = ("V4_QUALITY_48", "V4_DEFAULT_20", "V4_TURBO_12")
+LONGCAT_MODELS = ("longcat-image-edit", "longcat-image-edit-turbo")
 TASK_ID_PATTERN = re.compile(r"^[0-9a-f]{32}$")
 IDEMPOTENCY_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 UPLOAD_CHUNK_BYTES = 64 * 1024
+_ADMISSION_LOCK = threading.Lock()
 
 
 class RequestBodyTooLarge(BaseException):
@@ -132,69 +139,196 @@ async def _read_upload(file: UploadFile, max_bytes: int) -> bytes:
         await file.close()
 
 
+def _normalize_source(data: bytes) -> bytes:
+    try:
+        with Image.open(io.BytesIO(data)) as image:
+            image.load()
+            if image.format not in {"PNG", "JPEG", "WEBP"}:
+                raise InvalidImage("unsupported source image format")
+            if image.mode not in {"1", "L", "LA", "P", "RGB", "RGBA"}:
+                raise InvalidImage("unsupported source image mode")
+            normalized = image.convert("RGB")
+    except InvalidImage:
+        raise
+    except (OSError, ValueError) as exc:
+        raise InvalidImage("source image could not be normalized") from exc
+    output = io.BytesIO()
+    normalized.save(output, "PNG", compress_level=9, optimize=False)
+    return output.getvalue()
+
+
+def _persist_source_atomically(
+    source_dir: os.PathLike[str], data: bytes, original_hash: str
+) -> str:
+    directory = os.fspath(source_dir)
+    os.makedirs(directory, exist_ok=True)
+    normalized_hash = hashlib.sha256(data).hexdigest()
+    name = f"{original_hash}-{normalized_hash}.png"
+    final_path = os.path.join(directory, name)
+    if os.path.isfile(final_path):
+        with open(final_path, "rb") as handle:
+            if handle.read(len(data) + 1) != data:
+                raise OSError("persisted source content mismatch")
+        return name
+    temporary = os.path.join(directory, f".{name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "xb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, final_path)
+        directory_fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+    return name
+
+
+def _remove_orphan_source(source_dir: os.PathLike[str], name: str, store: TaskStore) -> None:
+    if store.source_referenced(name):
+        return
+    path = os.path.join(os.fspath(source_dir), name)
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.error(
+            "orphan source cleanup failed: source_name=%s",
+            name,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+        return
+    try:
+        directory_fd = os.open(os.fspath(source_dir), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError as exc:
+        logger.error(
+            "orphan source directory sync failed: source_name=%s",
+            name,
+            exc_info=(type(exc), exc, exc.__traceback__),
+        )
+
+
 def _safe_task(task: TaskRecord) -> dict[str, object]:
     result: dict[str, object] = {
         "taskId": task.task_id,
         "status": task.status,
-        "width": task.request["width"],
-        "height": task.request["height"],
-        "seed": task.request["seed"],
-        "samplerPreset": task.request["sampler_preset"],
     }
+    if task.request.get("task_type") == "image-edit":
+        result.update({"model": task.request["model"], "seed": task.request["seed"]})
+    else:
+        result.update(
+            {
+                "width": task.request["width"],
+                "height": task.request["height"],
+                "seed": task.request["seed"],
+                "samplerPreset": task.request["sampler_preset"],
+            }
+        )
     if task.error_code:
+        is_edit = task.request.get("task_type") == "image-edit"
         result["error"] = {
             "code": task.error_code,
-            "message": "Generation did not complete"
+            "message": ("Image edit did not complete" if is_edit else "Generation did not complete")
             if task.status == "failed"
-            else "Generation unavailable",
+            else ("Image edit unavailable" if is_edit else "Generation unavailable"),
         }
     return result
 
 
-def _generation_health(settings: Settings) -> dict[str, object]:
+def _generation_health(
+    settings: Settings, worker_status: dict[str, object]
+) -> tuple[dict[str, object], dict[str, object]]:
     repository_id = os.getenv("IMAGE_API_IDEOGRAM_REPOSITORY_ID", "ideogram-ai/ideogram-4-nf4")
-    mounted = ideogram_weights_available(settings.ideogram_weights_path, repository_id)
-    worker_available = settings.generation_test_mode or worker_heartbeat_alive(
-        settings.generation_heartbeat_path,
-        max_age_seconds=settings.generation_heartbeat_max_age_seconds,
-    )
-    if settings.generation_test_mode:
-        reason = None
-    elif not mounted:
-        reason = "weights_unavailable"
-    elif not worker_available:
-        reason = "worker_unavailable"
-    elif not settings.cuda_available:
-        reason = "cuda_unavailable"
-    else:
-        reason = None
-    loaded = False
-    model_state = "unloaded"
-    try:
-        status_path = settings.state_dir / "generation-model-status.json"
-        with status_path.open() as handle:
-            status = json.loads(handle.read(4096))
-        if isinstance(status, dict) and status.get("state") in {"unloaded", "loading", "loaded"}:
-            model_state = status["state"]
-            loaded = bool(status.get("loaded", False))
-    except (OSError, ValueError, TypeError):
-        pass
-    return {
-        "ready": reason is None,
-        "loaded": loaded,
-        "modelState": model_state,
-        "device": (
-            "cpu-test"
-            if settings.generation_test_mode
-            else "cuda"
-            if settings.cuda_available
-            else "unavailable"
+    mounted = {
+        "ideogram-4-nf4": settings.generation_test_mode
+        or ideogram_weights_available(settings.ideogram_weights_path, repository_id),
+        "longcat-image-edit": settings.generation_test_mode
+        or longcat_weights_available(
+            settings.longcat_edit_weights_path, settings.longcat_edit_revision
         ),
-        "quantization": "nf4",
-        "weightsAvailable": mounted,
-        "workerAvailable": worker_available,
-        "reason": reason,
+        "longcat-image-edit-turbo": settings.generation_test_mode
+        or longcat_weights_available(
+            settings.longcat_edit_turbo_weights_path, settings.longcat_edit_turbo_revision
+        ),
     }
+    worker_available = settings.generation_test_mode or (
+        bool(worker_status.get("workerReachable"))
+        and worker_heartbeat_alive(
+            settings.generation_heartbeat_path,
+            max_age_seconds=settings.generation_heartbeat_max_age_seconds,
+        )
+    )
+    loaded_model = worker_status.get("loadedModel")
+    if loaded_model not in {"ideogram-4-nf4", *LONGCAT_MODELS}:
+        loaded_model = None
+    raw_device = worker_status.get("device")
+    device = (
+        "cpu-test"
+        if settings.generation_test_mode
+        else raw_device
+        if raw_device in {"cuda", "unavailable"}
+        else "unavailable"
+    )
+    cuda_available = settings.generation_test_mode or device == "cuda"
+    raw_models = worker_status.get("models")
+    worker_models = raw_models if isinstance(raw_models, dict) else None
+
+    def model_weights_ready(model: str) -> bool:
+        if not mounted[model]:
+            return False
+        if worker_models is None:
+            return settings.generation_test_mode or bool(worker_status.get("ready"))
+        model_status = worker_models.get(model)
+        return isinstance(model_status, dict) and bool(model_status.get("weightsAvailable"))
+
+    def status(models: tuple[str, ...]) -> dict[str, object]:
+        model_weights = {model: model_weights_ready(model) for model in models}
+        model_ready = {
+            model: worker_available and cuda_available and available
+            for model, available in model_weights.items()
+        }
+        ready = all(model_ready.values())
+        reason = None
+        if not all(model_weights.values()):
+            reason = "weights_unavailable"
+        elif not worker_available:
+            reason = "worker_unavailable"
+        elif not cuda_available:
+            reason = "cuda_unavailable"
+        result: dict[str, object] = {
+            "ready": ready,
+            "loaded": loaded_model in models,
+            "device": device,
+            "weightsAvailable": all(model_weights.values()),
+            "workerAvailable": worker_available,
+            "reason": None if ready else reason,
+            "models": {
+                model: {
+                    "ready": model_ready[model],
+                    "weightsAvailable": model_weights[model],
+                    "loaded": loaded_model == model,
+                }
+                for model in models
+            },
+        }
+        if loaded_model in models:
+            result["loadedModel"] = loaded_model
+        return result
+
+    generation = status(("ideogram-4-nf4",))
+    generation["quantization"] = "nf4"
+    return generation, status(LONGCAT_MODELS)
 
 
 def create_app(
@@ -206,12 +340,16 @@ def create_app(
     settings = settings or Settings.from_env()
     settings.state_dir.mkdir(parents=True, exist_ok=True)
     settings.output_dir.mkdir(parents=True, exist_ok=True)
+    settings.source_dir.mkdir(parents=True, exist_ok=True)
     store = store or TaskStore(settings.database_path, settings.max_queue_depth)
     workers = workers or HttpWorkerClient(
         os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
         os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
         settings.worker_timeout_seconds,
         settings.max_request_bytes,
+        generation_url=os.getenv(
+            "IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"
+        ),
     )
     lane = GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds)
 
@@ -295,7 +433,11 @@ def create_app(
             loaded_model = worker_status.get("loadedModel")
             if loaded_model in allowed_models:
                 capability_status[capability]["loadedModel"] = loaded_model
-        capability_status["generation"] = _generation_health(settings)
+        generation_status, editing_status = _generation_health(
+            settings, raw_status.get("generation", {})
+        )
+        capability_status["generation"] = generation_status
+        capability_status["image-editing"] = editing_status
         return {
             "service": "image-api",
             "status": "ok"
@@ -317,11 +459,36 @@ def create_app(
                 {
                     "capability": "generation",
                     "model": "ideogram-4-nf4",
+                    "acceptsSourceImage": False,
                     "samplerPresets": list(SAMPLER_PRESETS),
                     "dimensions": {"minimum": 256, "maximum": 2048, "multipleOf": 16},
                 },
+                {
+                    "capability": "image-editing",
+                    "model": "longcat-image-edit",
+                    "acceptsSourceImage": True,
+                    "inputImages": 1,
+                    "defaults": {"guidanceScale": 4.5, "steps": 50},
+                },
+                {
+                    "capability": "image-editing",
+                    "model": "longcat-image-edit-turbo",
+                    "acceptsSourceImage": True,
+                    "inputImages": 1,
+                    "defaults": {"guidanceScale": 1.0, "steps": 8},
+                },
             ]
         }
+
+    @app.post("/v1/models/unload")
+    def unload_models() -> JSONResponse:
+        with lane.acquire("model-unload"):
+            results = workers.unload_all()
+        complete = all(bool(value.get("unloaded")) for value in results.values())
+        return JSONResponse(
+            {"unloaded": complete, "workers": results},
+            status_code=200 if complete else 503,
+        )
 
     @app.post("/v1/upscale", response_class=Response)
     async def upscale(
@@ -396,6 +563,109 @@ def create_app(
         )
         return Response(encoded, media_type="image/png")
 
+    @app.post("/v1/image-edits", status_code=202)
+    async def admit_image_edit(
+        file: Annotated[UploadFile, File()],
+        model: Annotated[Literal["longcat-image-edit", "longcat-image-edit-turbo"], Form()],
+        prompt: Annotated[str, Form(min_length=1, max_length=4000)],
+        seed: Annotated[int, Form(ge=0, le=2**32 - 1)],
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+        negative_prompt: Annotated[str, Form(max_length=4000)] = "",
+    ) -> dict[str, object]:
+        if not IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
+            raise HTTPException(422, "invalid idempotency key")
+        raw_status = workers.health().get("generation", {})
+        _, editing_status = _generation_health(settings, raw_status)
+        editing_models = editing_status.get("models")
+        selected_status = editing_models.get(model) if isinstance(editing_models, dict) else None
+        if not isinstance(selected_status, dict) or not bool(selected_status.get("ready")):
+            raise WorkerUnavailable("image-editing capability is unavailable")
+        data = await _read_upload(file, settings.max_upload_bytes)
+        info = validate_image(
+            data,
+            max_bytes=settings.max_upload_bytes,
+            max_width=settings.max_input_width,
+            max_height=settings.max_input_height,
+            max_pixels=settings.max_input_pixels,
+        )
+        original_hash = hashlib.sha256(data).hexdigest()
+        normalized = _normalize_source(data)
+        with _ADMISSION_LOCK:
+            candidate_name = f"{original_hash}-{hashlib.sha256(normalized).hexdigest()}.png"
+            source_existed = (settings.source_dir / candidate_name).is_file()
+            try:
+                source_name = _persist_source_atomically(
+                    settings.source_dir, normalized, original_hash
+                )
+            except OSError as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, candidate_name, store)
+                logger.error(
+                    "image-edit source persistence failed: source_name=%s",
+                    candidate_name,
+                    exc_info=(type(exc), exc, exc.__traceback__),
+                )
+                raise HTTPException(503, "source image could not be persisted") from exc
+            request: dict[str, object] = {
+                "task_type": "image-edit",
+                "model": model,
+                "prompt": prompt,
+                "negative_prompt": negative_prompt,
+                "seed": seed,
+                "source_image_sha256": original_hash,
+                "source_image_name": source_name,
+                "source_width": info.width,
+                "source_height": info.height,
+            }
+            try:
+                task = store.admit(idempotency_key, request)
+            except IdempotencyConflict as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(409, "idempotency key conflicts with another request") from exc
+            except QueueFull as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(503, "generation queue is full") from exc
+            except Exception:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                logger.exception("image-edit admission failed after source persistence")
+                raise
+        return _safe_task(task)
+
+    @app.get("/v1/image-edits/{task_id}")
+    def image_edit_status(task_id: str) -> dict[str, object]:
+        if not TASK_ID_PATTERN.fullmatch(task_id):
+            raise HTTPException(404, "task not found")
+        try:
+            task = store.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "task not found") from exc
+        if task.request.get("task_type") != "image-edit":
+            raise HTTPException(404, "task not found")
+        return _safe_task(task)
+
+    @app.get("/v1/image-edits/{task_id}/image")
+    def image_edit_image(task_id: str) -> FileResponse:
+        if not TASK_ID_PATTERN.fullmatch(task_id):
+            raise HTTPException(404, "task not found")
+        try:
+            task = store.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "task not found") from exc
+        if task.request.get("task_type") != "image-edit":
+            raise HTTPException(404, "task not found")
+        image_name = task.image_name
+        if task.status != "succeeded" or image_name != f"{task_id}.png":
+            raise HTTPException(409, "image-edit result is not available")
+        assert image_name is not None
+        path = settings.output_dir / image_name
+        if not path.is_file():
+            logger.error("image-edit result missing for succeeded task: task_id=%s", task_id)
+            raise HTTPException(503, "image-edit result is unavailable")
+        return FileResponse(path, media_type="image/png", filename=f"{task_id}.png")
+
     @app.post("/v1/generations", status_code=202)
     def admit_generation(
         body: GenerationRequest,
@@ -405,10 +675,13 @@ def create_app(
             raise HTTPException(422, "invalid idempotency key")
         if body.prompt is not None and settings.magic_prompt_backend is None:
             raise HTTPException(422, "plain prompt expansion is not configured")
-        if not bool(_generation_health(settings)["ready"]):
+        raw_status = workers.health().get("generation", {})
+        generation_status, _ = _generation_health(settings, raw_status)
+        if not bool(generation_status["ready"]):
             raise WorkerUnavailable("generation capability is unavailable")
+        request = body.model_dump(exclude_none=True) | {"model": "ideogram-4-nf4"}
         try:
-            task = store.admit(idempotency_key, body.model_dump(exclude_none=True))
+            task = store.admit(idempotency_key, request)
         except IdempotencyConflict as exc:
             raise HTTPException(409, "idempotency key conflicts with another request") from exc
         except QueueFull as exc:
@@ -420,9 +693,12 @@ def create_app(
         if not TASK_ID_PATTERN.fullmatch(task_id):
             raise HTTPException(404, "task not found")
         try:
-            return _safe_task(store.get(task_id))
+            task = store.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "task not found") from exc
+        if task.request.get("task_type") == "image-edit":
+            raise HTTPException(404, "task not found")
+        return _safe_task(task)
 
     @app.get("/v1/generations/{task_id}/image")
     def generation_image(task_id: str) -> FileResponse:
@@ -432,6 +708,8 @@ def create_app(
             task = store.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "task not found") from exc
+        if task.request.get("task_type") == "image-edit":
+            raise HTTPException(404, "task not found")
         if task.status != "succeeded" or task.image_name != f"{task_id}.png":
             raise HTTPException(409, "generation image is not available")
         path = settings.output_dir / task.image_name

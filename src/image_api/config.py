@@ -7,9 +7,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
-
 REPOSITORY_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 SNAPSHOT_PATTERN = re.compile(r"^[0-9a-f]{40,64}$")
+LONGCAT_EDIT_REVISION = "7b54ef423aa7854be7861600024be5c56ab7875a"
+LONGCAT_EDIT_TURBO_REVISION = "6a7262de5549f0bf0ec54c08ef7d283ef41f3214"
 
 
 def _weight_index_available(index_path: Path) -> bool:
@@ -76,6 +77,48 @@ def ideogram_weights_available(weights_path: Path, repository_id: str) -> bool:
     )
 
 
+def longcat_weights_available(weights_path: Path, revision: str) -> bool:
+    """Validate the complete subset loaded by the official Diffusers edit pipeline."""
+    if not SNAPSHOT_PATTERN.fullmatch(revision):
+        return False
+    try:
+        installed_revision = (weights_path / ".image-api-revision").read_text()[:65].strip()
+    except OSError:
+        return False
+    required = (
+        "config.json",
+        "model_index.json",
+        "scheduler/scheduler_config.json",
+        "text_encoder/config.json",
+        "text_encoder/generation_config.json",
+        "text_encoder/preprocessor_config.json",
+        "text_processor/chat_template.json",
+        "text_processor/config.json",
+        "text_processor/merges.txt",
+        "text_processor/preprocessor_config.json",
+        "text_processor/special_tokens_map.json",
+        "text_processor/tokenizer.json",
+        "text_processor/tokenizer_config.json",
+        "text_processor/vocab.json",
+        "tokenizer/chat_template.json",
+        "tokenizer/config.json",
+        "tokenizer/merges.txt",
+        "tokenizer/preprocessor_config.json",
+        "tokenizer/tokenizer.json",
+        "tokenizer/tokenizer_config.json",
+        "tokenizer/vocab.json",
+        "transformer/config.json",
+        "vae/config.json",
+    )
+    return (
+        installed_revision == revision
+        and all((weights_path / relative).is_file() for relative in required)
+        and _weights_available(weights_path / "text_encoder", "model.safetensors")
+        and _weights_available(weights_path / "transformer", "diffusion_pytorch_model.safetensors")
+        and _weights_available(weights_path / "vae", "diffusion_pytorch_model.safetensors")
+    )
+
+
 def _bool(name: str, default: bool) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -93,9 +136,14 @@ class Settings:
     state_dir: Path
     database_path: Path
     output_dir: Path
+    source_dir: Path
     gpu_lane_path: Path
     generation_heartbeat_path: Path
     ideogram_weights_path: Path
+    longcat_edit_weights_path: Path
+    longcat_edit_turbo_weights_path: Path
+    longcat_edit_revision: str = LONGCAT_EDIT_REVISION
+    longcat_edit_turbo_revision: str = LONGCAT_EDIT_TURBO_REVISION
     max_request_bytes: int = 21_000_000
     max_upload_bytes: int = 20_000_000
     max_input_width: int = 10_000
@@ -111,16 +159,32 @@ class Settings:
     generation_test_mode: bool = False
 
     @classmethod
-    def from_env(cls) -> "Settings":
+    def from_env(cls) -> Settings:
         state = Path(os.getenv("IMAGE_API_STATE_DIR", "/state"))
         values = cls(
             state_dir=state,
             database_path=state / "tasks.sqlite3",
             output_dir=state / "outputs",
+            source_dir=state / "sources",
             gpu_lane_path=state / "gpu-lane.lock",
             generation_heartbeat_path=state / "generation-worker.heartbeat",
             ideogram_weights_path=Path(
                 os.getenv("IMAGE_API_IDEOGRAM_WEIGHTS_PATH", "/models/ideogram-4-nf4")
+            ),
+            longcat_edit_weights_path=Path(
+                os.getenv("IMAGE_API_LONGCAT_EDIT_WEIGHTS_PATH", "/models/longcat-image-edit")
+            ),
+            longcat_edit_turbo_weights_path=Path(
+                os.getenv(
+                    "IMAGE_API_LONGCAT_EDIT_TURBO_WEIGHTS_PATH",
+                    "/models/longcat-image-edit-turbo",
+                )
+            ),
+            longcat_edit_revision=os.getenv(
+                "IMAGE_API_LONGCAT_EDIT_REVISION", LONGCAT_EDIT_REVISION
+            ),
+            longcat_edit_turbo_revision=os.getenv(
+                "IMAGE_API_LONGCAT_EDIT_TURBO_REVISION", LONGCAT_EDIT_TURBO_REVISION
             ),
             max_request_bytes=int(os.getenv("IMAGE_API_MAX_REQUEST_BYTES", "21000000")),
             max_upload_bytes=int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "20000000")),
@@ -161,16 +225,23 @@ class Settings:
             or self.generation_heartbeat_max_age_seconds <= 0
         ):
             raise ValueError("image-api timeouts must be positive")
+        if not SNAPSHOT_PATTERN.fullmatch(
+            self.longcat_edit_revision
+        ) or not SNAPSHOT_PATTERN.fullmatch(self.longcat_edit_turbo_revision):
+            raise ValueError("LongCat revisions must be immutable commit hashes")
 
     @classmethod
-    def for_tests(cls, root: Path, **overrides: Any) -> "Settings":
+    def for_tests(cls, root: Path, **overrides: Any) -> Settings:
         base = cls(
             state_dir=root,
             database_path=root / "tasks.sqlite3",
             output_dir=root / "outputs",
+            source_dir=root / "sources",
             gpu_lane_path=root / "gpu-lane.lock",
             generation_heartbeat_path=root / "generation-worker.heartbeat",
             ideogram_weights_path=root / "ideogram-weights",
+            longcat_edit_weights_path=root / "longcat-edit-weights",
+            longcat_edit_turbo_weights_path=root / "longcat-edit-turbo-weights",
             max_upload_bytes=1_000_000,
             max_request_bytes=1_100_000,
             max_input_pixels=1_000_000,
