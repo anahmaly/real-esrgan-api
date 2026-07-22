@@ -179,16 +179,21 @@ docker compose -f compose.yml -f compose.test.yml up --build
 
 ## Configuration bounds
 
-The defaults admit the explicit square-8K contract while keeping separate failure boundaries:
+The established generation/image-edit admission limits remain unchanged:
 
-- `IMAGE_API_MAX_REQUEST_BYTES=285000000` caps the complete multipart request.
-- `IMAGE_API_MAX_UPLOAD_BYTES=280000000` caps the encoded uploaded file at both gateway and processing worker.
-- `IMAGE_API_MAX_ENCODED_OUTPUT_BYTES=300000000` independently caps worker HTTP output and BiRefNet PNG post-processing.
-- `IMAGE_API_MAX_INPUT_WIDTH=8192` and `IMAGE_API_MAX_INPUT_HEIGHT=8192` cap each edge.
-- `IMAGE_API_MAX_INPUT_PIXELS=67108864` and `IMAGE_API_MAX_OUTPUT_PIXELS=67108864` cap decoded canvas area independently.
-- `IMAGE_API_MAX_DECODED_INPUT_BYTES=268435456` and `IMAGE_API_MAX_DECODED_OUTPUT_BYTES=268435456` conservatively budget four decoded bytes per admitted pixel.
-- `IMAGE_API_MAX_PROCESSING_WIDTH=16384`, `IMAGE_API_MAX_PROCESSING_HEIGHT=16384`, and `IMAGE_API_MAX_PROCESSING_PIXELS=268435456` separately bound Real-ESRGAN's native intermediate canvas.
-- `IMAGE_API_MAX_PROCESSING_BYTES=3221225472` bounds that native RGB intermediate at three float32 channels per pixel; it is an admission budget, not a promise about total allocator usage.
+- `IMAGE_API_MAX_REQUEST_BYTES=21000000` caps non-processing request bodies, including `/v1/image-edits`.
+- `IMAGE_API_MAX_UPLOAD_BYTES=20000000`, `IMAGE_API_MAX_INPUT_WIDTH=10000`, `IMAGE_API_MAX_INPUT_HEIGHT=10000`, and `IMAGE_API_MAX_INPUT_PIXELS=40000000` retain the existing edit upload and decoded-image contract.
+- `IMAGE_API_MAX_OUTPUT_PIXELS=80000000`, `IMAGE_API_MAX_DECODED_INPUT_BYTES=160000000`, and `IMAGE_API_MAX_DECODED_OUTPUT_BYTES=320000000` keep non-processing decoded memory bounded.
+
+The synchronous `/v1/upscale` and `/v1/background-removal` routes use separate 8K processing limits:
+
+- `IMAGE_API_PROCESSING_MAX_REQUEST_BYTES=285000000` caps the complete processing multipart request.
+- `IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES=280000000` caps the encoded processing upload at both gateway and worker.
+- `IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES=300000000` independently caps processing-worker HTTP output and BiRefNet PNG post-processing.
+- `IMAGE_API_PROCESSING_MAX_INPUT_WIDTH=8192`, `IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT=8192`, `IMAGE_API_PROCESSING_MAX_INPUT_PIXELS=67108864`, and `IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS=67108864` define the square-8K canvas contract.
+- `IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES=268435456` and `IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES=268435456` conservatively budget four decoded bytes per processing pixel.
+- `IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH=16384`, `IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT=16384`, and `IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS=268435456` separately bound Real-ESRGAN's native intermediate canvas.
+- `IMAGE_API_PROCESSING_MAX_NATIVE_BYTES=3221225472` bounds that native RGB intermediate at three float32 channels per pixel; it is an admission budget, not a promise about total allocator usage.
 - `IMAGE_API_WORKER_TIMEOUT_SECONDS=900` is the gateway-to-worker processing timeout. Increase it explicitly if a measured 8K run needs longer; timeout never changes requested dimensions.
 - `IMAGE_API_LANE_TIMEOUT_SECONDS` bounds waiting to enter the singleton GPU lane; it does not interrupt work that already owns the lane.
 - `IMAGE_API_MAX_QUEUE_DEPTH=100` bounds durable generation/edit admission.

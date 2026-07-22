@@ -52,14 +52,26 @@ class RequestBodyTooLarge(BaseException):
 
 
 class RequestBodyLimitMiddleware:
-    def __init__(self, app: Any, max_bytes: int) -> None:
+    def __init__(
+        self,
+        app: Any,
+        default_max_bytes: int,
+        route_max_bytes: dict[str, int],
+    ) -> None:
         self.app = app
-        self.max_bytes = max_bytes
+        self.default_max_bytes = default_max_bytes
+        self.route_max_bytes = route_max_bytes
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope["type"] != "http" or scope["method"] not in {"POST", "PUT", "PATCH"}:
             await self.app(scope, receive, send)
             return
+        path = scope.get("path")
+        max_bytes = (
+            self.route_max_bytes.get(path, self.default_max_bytes)
+            if isinstance(path, str)
+            else self.default_max_bytes
+        )
         headers = {key.lower(): value for key, value in scope.get("headers", [])}
         declared = headers.get(b"content-length")
         if declared is not None:
@@ -69,7 +81,7 @@ class RequestBodyLimitMiddleware:
                     status_code=400,
                 )(scope, receive, send)
                 return
-            if int(declared) > self.max_bytes:
+            if int(declared) > max_bytes:
                 await JSONResponse(
                     {"error": {"code": "request_too_large", "message": "Request is too large"}},
                     status_code=413,
@@ -83,7 +95,7 @@ class RequestBodyLimitMiddleware:
             message = cast(dict[str, Any], await receive())
             if message["type"] == "http.request":
                 consumed += len(message.get("body", b""))
-                if consumed > self.max_bytes:
+                if consumed > max_bytes:
                     raise RequestBodyTooLarge
             return message
 
@@ -152,11 +164,11 @@ async def _validated_sync_upload(file: UploadFile, settings: Settings) -> ImageI
         await file.seek(0)
         info = validate_image(
             file.file,
-            max_bytes=settings.max_upload_bytes,
-            max_width=settings.max_input_width,
-            max_height=settings.max_input_height,
-            max_pixels=settings.max_input_pixels,
-            max_decoded_bytes=settings.max_decoded_input_bytes,
+            max_bytes=settings.processing_max_upload_bytes,
+            max_width=settings.processing_max_input_width,
+            max_height=settings.processing_max_input_height,
+            max_pixels=settings.processing_max_input_pixels,
+            max_decoded_bytes=settings.processing_max_decoded_input_bytes,
         )
         await file.seek(0)
         return info
@@ -389,7 +401,7 @@ def create_app(
         os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
         os.getenv("IMAGE_API_BACKGROUND_WORKER_URL", "http://background-worker:9002"),
         settings.worker_timeout_seconds,
-        settings.max_encoded_output_bytes,
+        settings.processing_max_encoded_output_bytes,
         generation_url=os.getenv(
             "IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"
         ),
@@ -397,7 +409,14 @@ def create_app(
     lane = GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds)
 
     app = FastAPI(title="image-api", version="1.0.0")
-    app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.max_request_bytes)
+    app.add_middleware(
+        RequestBodyLimitMiddleware,
+        default_max_bytes=settings.max_request_bytes,
+        route_max_bytes={
+            "/v1/upscale": settings.processing_max_request_bytes,
+            "/v1/background-removal": settings.processing_max_request_bytes,
+        },
+    )
 
     @app.exception_handler(WorkerUnavailable)
     async def worker_unavailable(_: Request, exc: WorkerUnavailable) -> JSONResponse:
@@ -562,7 +581,7 @@ def create_app(
         try:
             expected = processing_output_size(info, outscale)
             settings.admit_upscale_processing(info.width, info.height)
-            settings.admit_output_dimensions(*expected)
+            settings.admit_processing_output_dimensions(*expected)
         except BaseException:
             await file.close()
             raise
@@ -575,9 +594,9 @@ def create_app(
                 encoded,
                 expected_size=expected,
                 required_mode="RGB",
-                max_bytes=settings.max_encoded_output_bytes,
-                max_pixels=settings.max_output_pixels,
-                max_decoded_bytes=settings.max_decoded_output_bytes,
+                max_bytes=settings.processing_max_encoded_output_bytes,
+                max_pixels=settings.processing_max_output_pixels,
+                max_decoded_bytes=settings.processing_max_decoded_output_bytes,
             )
         except Exception:
             if not isinstance(encoded, bytes):
@@ -602,7 +621,7 @@ def create_app(
     ) -> Response:
         info = await _validated_sync_upload(file, settings)
         try:
-            settings.admit_output_dimensions(info.width, info.height)
+            settings.admit_processing_output_dimensions(info.width, info.height)
         except BaseException:
             await file.close()
             raise
@@ -625,9 +644,9 @@ def create_app(
                 encoded,
                 expected_size=(info.width, info.height),
                 required_mode="RGBA",
-                max_bytes=settings.max_encoded_output_bytes,
-                max_pixels=settings.max_output_pixels,
-                max_decoded_bytes=settings.max_decoded_output_bytes,
+                max_bytes=settings.processing_max_encoded_output_bytes,
+                max_pixels=settings.processing_max_output_pixels,
+                max_decoded_bytes=settings.processing_max_decoded_output_bytes,
             )
         except Exception:
             if not isinstance(encoded, bytes):

@@ -96,7 +96,11 @@ def test_upscale_rejects_invalid_parameters_before_worker(
 def test_invalid_and_oversized_images_reject_before_worker(
     tmp_path, worker: FakeWorkerClient
 ) -> None:
-    settings = Settings.for_tests(tmp_path, max_upload_bytes=20, max_input_pixels=10)
+    settings = Settings.for_tests(
+        tmp_path,
+        processing_max_upload_bytes=20,
+        processing_max_input_pixels=10,
+    )
     client = TestClient(
         create_app(settings=settings, store=TaskStore(settings.database_path), workers=worker)
     )
@@ -135,7 +139,11 @@ def test_decompression_bomb_is_rejected_before_worker(
 
 
 def test_declared_body_limit_rejects_before_route(tmp_path, worker: FakeWorkerClient) -> None:
-    settings = Settings.for_tests(tmp_path, max_request_bytes=100, max_upload_bytes=90)
+    settings = Settings.for_tests(
+        tmp_path,
+        processing_max_request_bytes=100,
+        processing_max_upload_bytes=90,
+    )
     client = TestClient(
         create_app(settings=settings, store=TaskStore(settings.database_path), workers=worker)
     )
@@ -145,4 +153,28 @@ def test_declared_body_limit_rejects_before_route(tmp_path, worker: FakeWorkerCl
         headers={"Content-Length": "101"},
     )
     assert response.status_code == 413
+    assert worker.model_invocations == 0
+
+
+def test_unknown_routes_and_malformed_lengths_use_safe_default_limit(
+    tmp_path, worker: FakeWorkerClient
+) -> None:
+    settings = Settings.for_tests(
+        tmp_path,
+        max_request_bytes=100,
+        max_upload_bytes=90,
+        processing_max_request_bytes=1_000,
+        processing_max_upload_bytes=900,
+    )
+    client = TestClient(
+        create_app(settings=settings, store=TaskStore(settings.database_path), workers=worker)
+    )
+
+    unknown = client.post("/v1/not-a-route", content=b"small", headers={"Content-Length": "101"})
+    malformed = client.post(
+        "/v1/upscale", content=b"small", headers={"Content-Length": "not-a-number"}
+    )
+
+    assert unknown.status_code == 413
+    assert malformed.status_code == 400
     assert worker.model_invocations == 0

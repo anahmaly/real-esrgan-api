@@ -114,6 +114,45 @@ def test_image_edit_validates_source_and_fields_before_admission(tmp_path) -> No
     assert store.count() == 0
 
 
+def test_image_edit_keeps_established_body_limit_while_processing_uses_8k_limit(
+    tmp_path,
+) -> None:
+    settings = Settings.for_tests(
+        tmp_path,
+        max_request_bytes=21_000_000,
+        max_upload_bytes=20_000_000,
+        processing_max_request_bytes=285_000_000,
+        processing_max_upload_bytes=280_000_000,
+    )
+    store = TaskStore(settings.database_path)
+    worker = FakeWorkerClient()
+    client = TestClient(create_app(settings=settings, store=store, workers=worker))
+
+    rejected_edit = client.post(
+        "/v1/image-edits",
+        data={
+            "model": "longcat-image-edit",
+            "prompt": "keep the established boundary",
+            "seed": "43",
+        },
+        files={"file": ("source.png", png("RGB", (2, 2)), "image/png")},
+        headers={
+            "Idempotency-Key": "edit-size-boundary",
+            "Content-Length": str(settings.max_request_bytes + 1),
+        },
+    )
+    admitted_processing = client.post(
+        "/v1/upscale?model=RealESRGAN_x4plus&outscale=2&tile=512",
+        files={"file": ("source.png", png("RGB", (2, 2)), "image/png")},
+        headers={"Content-Length": str(settings.processing_max_request_bytes)},
+    )
+
+    assert rejected_edit.status_code == 413
+    assert store.count() == 0
+    assert admitted_processing.status_code == 200
+    assert worker.model_invocations == 1
+
+
 def test_edit_runner_consumes_persisted_image_and_atomically_publishes_rgb_png(tmp_path) -> None:
     client, settings, store = _client(tmp_path)
     admitted = _edit(client, "edit-run", model="longcat-image-edit-turbo")

@@ -87,10 +87,12 @@ def _validate_worker_dimensions(width: int, height: int, *, output: bool) -> Non
     validate_dimensions(
         width,
         height,
-        max_width=int(os.getenv("IMAGE_API_MAX_INPUT_WIDTH", "8192")),
-        max_height=int(os.getenv("IMAGE_API_MAX_INPUT_HEIGHT", "8192")),
-        max_pixels=int(os.getenv(f"IMAGE_API_MAX_{suffix}_PIXELS", "67108864")),
-        max_decoded_bytes=int(os.getenv(f"IMAGE_API_MAX_DECODED_{suffix}_BYTES", "268435456")),
+        max_width=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "8192")),
+        max_height=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "8192")),
+        max_pixels=int(os.getenv(f"IMAGE_API_PROCESSING_MAX_{suffix}_PIXELS", "67108864")),
+        max_decoded_bytes=int(
+            os.getenv(f"IMAGE_API_PROCESSING_MAX_DECODED_{suffix}_BYTES", "268435456")
+        ),
     )
 
 
@@ -155,7 +157,9 @@ def _run_background(
         return_alpha=False,
         return_checker_preview=False,
         checker_size=32,
-        max_encoded_bytes=int(os.getenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "300000000")),
+        max_encoded_bytes=int(
+            os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")
+        ),
     )
     if not isinstance(encoded, bytes):
         raise RuntimeError("background post-processing returned invalid bytes")
@@ -236,7 +240,7 @@ async def remove_background(
     birefnet_foreground_refinement: bool = False,
     model_input_size: Annotated[int, Query(ge=512, le=2048)] = 1024,
 ) -> Response:
-    max_upload_bytes = int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "280000000"))
+    max_upload_bytes = int(os.getenv("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"))
     data = await read_bounded_upload(file, max_upload_bytes)
     try:
 

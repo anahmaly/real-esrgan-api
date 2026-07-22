@@ -167,7 +167,7 @@ def test_switching_remaining_models_releases_resident_model(monkeypatch, tmp_pat
 def test_background_postprocessing_uses_configured_encoded_ceiling(monkeypatch) -> None:
     calls: list[tuple[str, dict[str, object]]] = []
     _install_pr7_fakes(monkeypatch, calls)
-    monkeypatch.setenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "345000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "345000000")
     observed: dict[str, object] = {}
     processing = sys.modules["rembg_api.image_processing"]
 

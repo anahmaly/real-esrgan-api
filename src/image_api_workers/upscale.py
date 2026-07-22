@@ -145,10 +145,12 @@ def _validate_worker_dimensions(width: int, height: int, *, output: bool) -> Non
     validate_dimensions(
         width,
         height,
-        max_width=int(os.getenv("IMAGE_API_MAX_INPUT_WIDTH", "8192")),
-        max_height=int(os.getenv("IMAGE_API_MAX_INPUT_HEIGHT", "8192")),
-        max_pixels=int(os.getenv(f"IMAGE_API_MAX_{suffix}_PIXELS", "67108864")),
-        max_decoded_bytes=int(os.getenv(f"IMAGE_API_MAX_DECODED_{suffix}_BYTES", "268435456")),
+        max_width=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_WIDTH", "8192")),
+        max_height=int(os.getenv("IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT", "8192")),
+        max_pixels=int(os.getenv(f"IMAGE_API_PROCESSING_MAX_{suffix}_PIXELS", "67108864")),
+        max_decoded_bytes=int(
+            os.getenv(f"IMAGE_API_PROCESSING_MAX_DECODED_{suffix}_BYTES", "268435456")
+        ),
     )
 
 
@@ -157,10 +159,11 @@ def _validate_native_processing(width: int, height: int) -> None:
     native_height = height * 4
     native_pixels = native_width * native_height
     if (
-        native_width > int(os.getenv("IMAGE_API_MAX_PROCESSING_WIDTH", "16384"))
-        or native_height > int(os.getenv("IMAGE_API_MAX_PROCESSING_HEIGHT", "16384"))
-        or native_pixels > int(os.getenv("IMAGE_API_MAX_PROCESSING_PIXELS", "268435456"))
-        or native_pixels * 3 * 4 > int(os.getenv("IMAGE_API_MAX_PROCESSING_BYTES", "3221225472"))
+        native_width > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH", "16384"))
+        or native_height > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT", "16384"))
+        or native_pixels > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS", "268435456"))
+        or native_pixels * 3 * 4
+        > int(os.getenv("IMAGE_API_PROCESSING_MAX_NATIVE_BYTES", "3221225472"))
     ):
         raise ValueError("Real-ESRGAN native processing exceeds configured limit")
 
@@ -221,7 +224,7 @@ async def upscale(
 ) -> Response:
     if tile and tile % 32:
         raise HTTPException(422, "invalid tile")
-    max_upload_bytes = int(os.getenv("IMAGE_API_MAX_UPLOAD_BYTES", "280000000"))
+    max_upload_bytes = int(os.getenv("IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES", "280000000"))
     data = await read_bounded_upload(file, max_upload_bytes)
     try:
 
@@ -240,7 +243,9 @@ async def upscale(
             "upscale",
             operation,
         )
-        max_output_bytes = int(os.getenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "300000000"))
+        max_output_bytes = int(
+            os.getenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "300000000")
+        )
         if len(encoded) > max_output_bytes:
             raise RuntimeError("encoded upscale output exceeds configured limit")
         return Response(encoded, media_type="image/png")

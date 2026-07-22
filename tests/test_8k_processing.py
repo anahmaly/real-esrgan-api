@@ -32,54 +32,70 @@ SQUARE_8K = 8192
 SQUARE_8K_PIXELS = 67_108_864
 
 
-def test_8k_defaults_are_independent_and_cover_rgba_contract(monkeypatch, tmp_path: Path) -> None:
+def test_8k_defaults_are_processing_only_and_cover_rgba_contract(
+    monkeypatch, tmp_path: Path
+) -> None:
     monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
     for name in (
         "IMAGE_API_MAX_REQUEST_BYTES",
         "IMAGE_API_MAX_UPLOAD_BYTES",
-        "IMAGE_API_MAX_ENCODED_OUTPUT_BYTES",
         "IMAGE_API_MAX_INPUT_WIDTH",
         "IMAGE_API_MAX_INPUT_HEIGHT",
         "IMAGE_API_MAX_INPUT_PIXELS",
         "IMAGE_API_MAX_OUTPUT_PIXELS",
         "IMAGE_API_MAX_DECODED_INPUT_BYTES",
         "IMAGE_API_MAX_DECODED_OUTPUT_BYTES",
-        "IMAGE_API_MAX_PROCESSING_WIDTH",
-        "IMAGE_API_MAX_PROCESSING_HEIGHT",
-        "IMAGE_API_MAX_PROCESSING_PIXELS",
-        "IMAGE_API_MAX_PROCESSING_BYTES",
+        "IMAGE_API_PROCESSING_MAX_REQUEST_BYTES",
+        "IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES",
+        "IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES",
+        "IMAGE_API_PROCESSING_MAX_INPUT_WIDTH",
+        "IMAGE_API_PROCESSING_MAX_INPUT_HEIGHT",
+        "IMAGE_API_PROCESSING_MAX_INPUT_PIXELS",
+        "IMAGE_API_PROCESSING_MAX_OUTPUT_PIXELS",
+        "IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES",
+        "IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES",
+        "IMAGE_API_PROCESSING_MAX_NATIVE_WIDTH",
+        "IMAGE_API_PROCESSING_MAX_NATIVE_HEIGHT",
+        "IMAGE_API_PROCESSING_MAX_NATIVE_PIXELS",
+        "IMAGE_API_PROCESSING_MAX_NATIVE_BYTES",
         "IMAGE_API_WORKER_TIMEOUT_SECONDS",
     ):
         monkeypatch.delenv(name, raising=False)
 
     settings = Settings.from_env()
 
-    assert settings.max_input_width == SQUARE_8K
-    assert settings.max_input_height == SQUARE_8K
-    assert settings.max_input_pixels == SQUARE_8K_PIXELS
-    assert settings.max_output_pixels == SQUARE_8K_PIXELS
-    assert settings.max_decoded_input_bytes >= SQUARE_8K_PIXELS * 4
-    assert settings.max_decoded_output_bytes >= SQUARE_8K_PIXELS * 4
+    assert settings.max_request_bytes == 21_000_000
+    assert settings.max_upload_bytes == 20_000_000
+    assert settings.max_input_width == 10_000
+    assert settings.max_input_height == 10_000
+    assert settings.max_input_pixels == 40_000_000
+    assert settings.max_output_pixels == 80_000_000
+    assert settings.processing_max_input_width == SQUARE_8K
+    assert settings.processing_max_input_height == SQUARE_8K
+    assert settings.processing_max_input_pixels == SQUARE_8K_PIXELS
+    assert settings.processing_max_output_pixels == SQUARE_8K_PIXELS
+    assert settings.processing_max_decoded_input_bytes >= SQUARE_8K_PIXELS * 4
+    assert settings.processing_max_decoded_output_bytes >= SQUARE_8K_PIXELS * 4
     assert settings.admit_upscale_processing(SQUARE_4K, SQUARE_4K) == (16384, 16384)
-    assert settings.max_request_bytes > settings.max_upload_bytes
-    assert settings.max_encoded_output_bytes > 40_000_000
+    assert settings.processing_max_request_bytes > settings.processing_max_upload_bytes
+    assert settings.processing_max_encoded_output_bytes > 40_000_000
     assert settings.worker_timeout_seconds >= 600
 
 
 def test_8k_limits_and_timeout_accept_environment_overrides(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setenv("IMAGE_API_STATE_DIR", str(tmp_path))
-    monkeypatch.setenv("IMAGE_API_MAX_ENCODED_OUTPUT_BYTES", "345000000")
-    monkeypatch.setenv("IMAGE_API_MAX_DECODED_INPUT_BYTES", "300000000")
-    monkeypatch.setenv("IMAGE_API_MAX_DECODED_OUTPUT_BYTES", "310000000")
-    monkeypatch.setenv("IMAGE_API_MAX_PROCESSING_BYTES", "4000000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_ENCODED_OUTPUT_BYTES", "345000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_DECODED_INPUT_BYTES", "300000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_DECODED_OUTPUT_BYTES", "310000000")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_NATIVE_BYTES", "4000000000")
     monkeypatch.setenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "1234")
 
     settings = Settings.from_env()
 
-    assert settings.max_encoded_output_bytes == 345_000_000
-    assert settings.max_decoded_input_bytes == 300_000_000
-    assert settings.max_decoded_output_bytes == 310_000_000
-    assert settings.max_processing_bytes == 4_000_000_000
+    assert settings.processing_max_encoded_output_bytes == 345_000_000
+    assert settings.processing_max_decoded_input_bytes == 300_000_000
+    assert settings.processing_max_decoded_output_bytes == 310_000_000
+    assert settings.processing_max_native_bytes == 4_000_000_000
     assert settings.worker_timeout_seconds == 1234
 
     monkeypatch.setenv("IMAGE_API_WORKER_TIMEOUT_SECONDS", "nan")
@@ -95,23 +111,23 @@ def test_exact_staged_square_dimension_math_without_allocating_8k_images() -> No
 def test_8k_output_admission_is_exact_and_too_large_is_rejected() -> None:
     settings = Settings.for_tests(
         Path("/tmp/image-api-boundary-test"),
-        max_input_width=SQUARE_8K,
-        max_input_height=SQUARE_8K,
-        max_input_pixels=SQUARE_8K_PIXELS,
-        max_output_pixels=SQUARE_8K_PIXELS,
-        max_decoded_input_bytes=SQUARE_8K_PIXELS * 4,
-        max_decoded_output_bytes=SQUARE_8K_PIXELS * 4,
+        processing_max_input_width=SQUARE_8K,
+        processing_max_input_height=SQUARE_8K,
+        processing_max_input_pixels=SQUARE_8K_PIXELS,
+        processing_max_output_pixels=SQUARE_8K_PIXELS,
+        processing_max_decoded_input_bytes=SQUARE_8K_PIXELS * 4,
+        processing_max_decoded_output_bytes=SQUARE_8K_PIXELS * 4,
     )
-    assert settings.admit_output_dimensions(SQUARE_8K, SQUARE_8K) == (
+    assert settings.admit_processing_output_dimensions(SQUARE_8K, SQUARE_8K) == (
         SQUARE_8K,
         SQUARE_8K,
     )
     with pytest.raises(ImageTooLarge):
-        settings.admit_output_dimensions(SQUARE_8K + 1, SQUARE_8K)
+        settings.admit_processing_output_dimensions(SQUARE_8K + 1, SQUARE_8K)
 
     constrained = Settings.for_tests(
         Path("/tmp/image-api-processing-boundary-test"),
-        max_processing_width=16383,
+        processing_max_native_width=16383,
     )
     with pytest.raises(ImageTooLarge, match="native processing"):
         constrained.admit_upscale_processing(SQUARE_4K, SQUARE_4K)
@@ -192,7 +208,7 @@ def test_realesrgan_large_input_cannot_disable_tiling() -> None:
 def test_processing_workers_reject_configured_pixel_overflow_without_large_fixture(
     monkeypatch,
 ) -> None:
-    monkeypatch.setenv("IMAGE_API_MAX_INPUT_PIXELS", "5")
+    monkeypatch.setenv("IMAGE_API_PROCESSING_MAX_INPUT_PIXELS", "5")
     with pytest.raises(ImageTooLarge):
         upscale._load_rgb_source(png("RGB", (3, 2)))
     with pytest.raises(ImageTooLarge):
