@@ -8,7 +8,7 @@ Only the `image-api` gateway publishes port `8000`. Worker control routes are Co
 
 Before a selected worker loads or runs a model, it asks every peer worker to unload resident models while it still owns the global lane. Peer eviction fails closed: an unreachable peer prevents the new model from loading. The generation worker also unloads on switches among `ideogram-4-nf4`, `longcat-image-edit`, and `longcat-image-edit-turbo`. Same-worker/same-model requests may reuse the resident pipeline. Disposal removes Diffusers/Accelerate hooks, clears model references, runs garbage collection, and conditionally clears the CUDA allocator.
 
-Generation and edit admissions use synchronous SQLite durability. Every shared-state writer runs as numeric UID/GID `10001:10001`. The root-only `state-init` one-shot preflights and then performs a no-symlink, same-volume ownership migration capped by `IMAGE_API_STATE_INIT_MAX_ENTRIES` and `IMAGE_API_STATE_INIT_MAX_DEPTH`; all writers wait for it to finish. The startup volume must remain quiescent throughout init so the preflight tree is the tree that is migrated. Gateway readiness then proves that the source lock/file path and SQLite are writable without loading or invoking a model. Image-edit source bytes are validated, normalized to a deterministic RGB PNG, fsynced, and atomically published under `/state/sources` before `202` is returned. The durable idempotency fingerprint includes the exact uploaded-byte SHA-256 and every semantic parameter. Results are validated RGB PNGs, fsynced, atomically renamed, and then marked successful. Restart reconciliation never re-invokes an interrupted task.
+Generation, edit, upscale-task, and background-removal-task admissions use synchronous SQLite durability. Every shared-state writer runs as numeric UID/GID `10001:10001`. The root-only `state-init` one-shot preflights and then performs a no-symlink, same-volume ownership migration capped by `IMAGE_API_STATE_INIT_MAX_ENTRIES` and `IMAGE_API_STATE_INIT_MAX_DEPTH`; all writers wait for it to finish. The startup volume must remain quiescent throughout init so the preflight tree is the tree that is migrated. Gateway readiness then proves that the source lock/file path and SQLite are writable without loading or invoking a model. Image-edit source bytes are validated, normalized to a deterministic RGB PNG, fsynced, and atomically published under `/state/sources` before `202` is returned. The durable idempotency fingerprint includes the exact uploaded-byte SHA-256 and every semantic parameter. Results are validated RGB PNGs, fsynced, atomically renamed, and then marked successful. Restart reconciliation never re-invokes an interrupted task.
 
 ## Public API
 
@@ -16,6 +16,8 @@ Generation and edit admissions use synchronous SQLite durability. Every shared-s
 - `GET /v1/models` — supported models and honest generation/editing contracts.
 - `POST /v1/upscale` — synchronous multipart upscale.
 - `POST /v1/background-removal` — synchronous multipart background removal.
+- `POST /v1/upscale-tasks` plus `GET /v1/upscale-tasks/{taskId}` and `/image` — durable asynchronous upscale.
+- `POST /v1/background-removal-tasks` plus matching `GET` status and `/image` routes — durable asynchronous background removal.
 - `POST /v1/generations` — durable asynchronous Ideogram generation.
 - `GET /v1/generations/{taskId}` and `/image` — generation status/result.
 - `POST /v1/image-edits` — durable asynchronous LongCat single-image edit.
@@ -44,6 +46,72 @@ curl -f -X POST \
 ```
 
 The gateway and worker reject a dimension or mode mismatch; they never silently substitute a 4K result for a failed 8K request. "4K" here means square `4096x4096`, and "8K" means square `8192x8192`, not UHD landscape.
+
+### Durable upscale and background-removal tasks
+
+The task routes are the crash-safe consumer contract; the synchronous routes above remain unchanged for backward compatibility. Admission validates and fsyncs the source plus SQLite request before returning `202`. It does not probe readiness, load a model, enter the GPU lane, or invoke inference.
+
+Upscale admission is multipart `file` plus required `Idempotency-Key` and the same query contract as synchronous upscale:
+
+```sh
+curl -f -X POST \
+  -H 'Idempotency-Key: listing-123-upscale-4k-v1' \
+  'http://HOST:8000/v1/upscale-tasks?model=RealESRGAN_x4plus&outscale=4&tile=512' \
+  -F 'file=@clipart-1024-rgb.png'
+```
+
+Background-removal admission is multipart `file` plus required `Idempotency-Key`. Its query fields are `model`, `alpha_blur` (`0–20`, default `0`), `alpha_erode`/`alpha_dilate` (`0–100`, default `0`), `alpha_threshold` (`0–255`, default `0`), `birefnet_inference_size` (`512–4096`, default `2048`), `birefnet_foreground_refinement` (default `false`), `model_input_size` (`512–2048`, default `1024`), `despill_enabled` (default `false`), `despill_color` (`black|white|green|blue|custom`, default `black`), and six-digit `despill_hex_color` (default `000000`).
+
+```sh
+curl -f -X POST \
+  -H 'Idempotency-Key: listing-123-background-v1' \
+  'http://HOST:8000/v1/background-removal-tasks?model=birefnet-hr-matting&birefnet_inference_size=4096&birefnet_foreground_refinement=true&alpha_blur=0&alpha_erode=0&alpha_dilate=0&alpha_threshold=0&despill_enabled=false&despill_color=black&despill_hex_color=000000' \
+  -F 'file=@clipart-8192-rgb.png'
+```
+
+Every accepted or exact-replay admission returns `202` with this status shape (values shown are an upscale example):
+
+```json
+{
+  "taskId": "32-lowercase-hex-characters",
+  "status": "queued",
+  "capability": "upscale",
+  "model": "RealESRGAN_x4plus",
+  "sourceSha256": "64-lowercase-hex-characters",
+  "requestedWidth": 1024,
+  "requestedHeight": 1024,
+  "expectedWidth": 4096,
+  "expectedHeight": 4096,
+  "expectedMode": "RGB"
+}
+```
+
+`status` is `queued`, `running`, `succeeded`, or `failed`. A failed response adds `error: {"code": "bounded_code", "message": "Image processing did not complete"}`. A succeeded response adds immutable output metadata:
+
+```json
+{
+  "output": {
+    "fileName": "TASK_ID.png",
+    "sha256": "64-lowercase-hex-characters",
+    "width": 4096,
+    "height": 4096,
+    "mode": "RGB"
+  }
+}
+```
+
+Poll and download through the matching capability route. Download returns `409` until the task succeeds and `503` if a succeeded task's persisted result is missing, corrupt, or inconsistent; it never invokes inference or changes task state.
+
+```sh
+curl -f http://HOST:8000/v1/upscale-tasks/TASK_ID
+curl -f http://HOST:8000/v1/upscale-tasks/TASK_ID/image -o upscaled.png
+curl -f http://HOST:8000/v1/background-removal-tasks/TASK_ID
+curl -f http://HOST:8000/v1/background-removal-tasks/TASK_ID/image -o transparent.png
+```
+
+Idempotency binds the capability, exact model, exact uploaded-byte SHA-256/source identity, requested dimensions, expected dimensions/mode, and every semantic query field listed above. Replaying the same key and exact source/parameters returns the original task in its current state. Reusing the key with any different source byte or field returns `409`.
+
+Each processing worker claims only its exact capability. All durable task kinds share the explicit `IMAGE_API_MAX_QUEUE_DEPTH` active-task bound and the existing singleton GPU lane/peer-unload policy. On restart, queued tasks remain queued. A running task with a fully fsynced, valid task-bound output reconciles to `succeeded` without inference; a running task without one becomes terminal `failed` with `worker_interrupted` and is never silently requeued or retried. Terminal source cleanup is content-addressed, source-reference-aware, and coordinated by the shared source lock.
 
 ### Background removal
 
@@ -185,7 +253,7 @@ The established generation/image-edit admission limits remain unchanged:
 - `IMAGE_API_MAX_UPLOAD_BYTES=20000000`, `IMAGE_API_MAX_INPUT_WIDTH=10000`, `IMAGE_API_MAX_INPUT_HEIGHT=10000`, and `IMAGE_API_MAX_INPUT_PIXELS=40000000` retain the existing edit upload and decoded-image contract.
 - `IMAGE_API_MAX_OUTPUT_PIXELS=80000000`, `IMAGE_API_MAX_DECODED_INPUT_BYTES=160000000`, and `IMAGE_API_MAX_DECODED_OUTPUT_BYTES=320000000` keep non-processing decoded memory bounded.
 
-The synchronous `/v1/upscale` and `/v1/background-removal` routes use separate 8K processing limits:
+The synchronous and durable-task `/v1/upscale` and `/v1/background-removal` route families use separate 8K processing limits:
 
 - `IMAGE_API_PROCESSING_MAX_REQUEST_BYTES=285000000` caps the complete processing multipart request.
 - `IMAGE_API_PROCESSING_MAX_UPLOAD_BYTES=280000000` caps the encoded processing upload at both gateway and worker.
@@ -196,7 +264,7 @@ The synchronous `/v1/upscale` and `/v1/background-removal` routes use separate 8
 - `IMAGE_API_PROCESSING_MAX_NATIVE_BYTES=3221225472` bounds that native RGB intermediate at three float32 channels per pixel; it is an admission budget, not a promise about total allocator usage.
 - `IMAGE_API_WORKER_TIMEOUT_SECONDS=900` is the gateway-to-worker processing timeout. Increase it explicitly if a measured 8K run needs longer; timeout never changes requested dimensions.
 - `IMAGE_API_LANE_TIMEOUT_SECONDS` bounds waiting to enter the singleton GPU lane; it does not interrupt work that already owns the lane.
-- `IMAGE_API_MAX_QUEUE_DEPTH=100` bounds durable generation/edit admission.
+- `IMAGE_API_MAX_QUEUE_DEPTH=100` bounds queued plus running durable tasks across generation, image editing, upscale, and background removal.
 - `IMAGE_API_STATE_INIT_MAX_ENTRIES=100000` bounds the existing-volume ownership migration and fails startup before ownership or mode changes when preflight exceeds it.
 - `IMAGE_API_STATE_INIT_MAX_DEPTH=32` bounds nested directories (the state root is depth zero), limiting live traversal descriptors independently of entry count. The state layout is normally only a few levels deep (`tasks.sqlite3`, locks, and source files), so 32 leaves substantial legacy-layout headroom without relying on the host's open-file ceiling. Init preflights both bounds before migration; keep the startup volume quiescent until `state-init` completes.
 

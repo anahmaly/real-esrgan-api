@@ -30,8 +30,9 @@ from image_api.images import (
     validate_png_output,
 )
 from image_api.lane import GpuLane, LaneBusy
+from image_api.processing import validate_processing_output
 from image_api.state import state_write_ready
-from image_api.store import IdempotencyConflict, QueueFull, TaskRecord, TaskStore
+from image_api.store import IdempotencyConflict, QueueFull, TaskKind, TaskRecord, TaskStore
 from image_api.workers import HttpWorkerClient, WorkerClient, WorkerUnavailable
 
 logger = logging.getLogger(__name__)
@@ -311,6 +312,83 @@ def _safe_task(task: TaskRecord) -> dict[str, object]:
     return result
 
 
+def _safe_processing_task(task: TaskRecord) -> dict[str, object]:
+    result: dict[str, object] = {
+        "taskId": task.task_id,
+        "status": task.status,
+        "capability": task.task_kind,
+        "model": task.request["model"],
+        "sourceSha256": task.request["source_image_sha256"],
+        "requestedWidth": task.request["requested_width"],
+        "requestedHeight": task.request["requested_height"],
+        "expectedWidth": task.request["expected_width"],
+        "expectedHeight": task.request["expected_height"],
+        "expectedMode": task.request["expected_mode"],
+    }
+    if task.status == "succeeded":
+        result["output"] = {
+            "fileName": task.image_name,
+            "sha256": task.output_sha256,
+            "width": task.output_width,
+            "height": task.output_height,
+            "mode": task.output_mode,
+        }
+    if task.error_code:
+        result["error"] = {
+            "code": task.error_code,
+            "message": "Image processing did not complete",
+        }
+    return result
+
+
+async def _persist_processing_upload(
+    file: UploadFile, settings: Settings
+) -> tuple[str, str, ImageInfo, bool]:
+    settings.source_dir.mkdir(parents=True, exist_ok=True)
+    temporary = settings.source_dir / f".processing-upload.{uuid.uuid4().hex}.tmp"
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        with temporary.open("xb") as target:
+            while chunk := await file.read(UPLOAD_CHUNK_BYTES):
+                total += len(chunk)
+                if total > settings.processing_max_upload_bytes:
+                    raise ImageTooLarge("upload exceeds configured limit")
+                digest.update(chunk)
+                target.write(chunk)
+            target.flush()
+            os.fsync(target.fileno())
+        with temporary.open("rb") as handle:
+            info = validate_image(
+                handle,
+                max_bytes=settings.processing_max_upload_bytes,
+                max_width=settings.processing_max_input_width,
+                max_height=settings.processing_max_input_height,
+                max_pixels=settings.processing_max_input_pixels,
+                max_decoded_bytes=settings.processing_max_decoded_input_bytes,
+            )
+        source_hash = digest.hexdigest()
+        source_name = f"{source_hash}-{source_hash}.png"
+        final_path = settings.source_dir / source_name
+        existed = final_path.is_file()
+        if existed:
+            with final_path.open("rb") as existing:
+                existing_hash = hashlib.file_digest(existing, "sha256").hexdigest()
+            if existing_hash != source_hash:
+                raise OSError("persisted source content mismatch")
+        else:
+            os.replace(temporary, final_path)
+            directory_fd = os.open(settings.source_dir, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        return source_name, source_hash, info, existed
+    finally:
+        temporary.unlink(missing_ok=True)
+        await file.close()
+
+
 def _generation_health(
     settings: Settings, worker_status: dict[str, object]
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -425,6 +503,8 @@ def create_app(
         route_max_bytes={
             "/v1/upscale": settings.processing_max_request_bytes,
             "/v1/background-removal": settings.processing_max_request_bytes,
+            "/v1/upscale-tasks": settings.processing_max_request_bytes,
+            "/v1/background-removal-tasks": settings.processing_max_request_bytes,
         },
     )
 
@@ -577,6 +657,190 @@ def create_app(
             {"unloaded": complete, "workers": results},
             status_code=200 if complete else 503,
         )
+
+    @app.post("/v1/upscale-tasks", status_code=202)
+    async def admit_upscale_task(
+        file: Annotated[UploadFile, File()],
+        model: Annotated[Literal["RealESRGAN_x4plus", "RealESRGAN_x4plus_anime_6B"], Query()],
+        outscale: Annotated[float, Query(ge=1, le=4)],
+        tile: Annotated[int, Query(ge=0, le=1024)],
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+    ) -> dict[str, object]:
+        if not IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
+            await file.close()
+            raise HTTPException(422, "invalid idempotency key")
+        if tile != 0 and tile % 32:
+            await file.close()
+            raise HTTPException(422, "tile must be zero or a multiple of 32")
+        with _ADMISSION_LOCK, source_file_lock(settings.source_dir):
+            source_name, source_hash, info, source_existed = await _persist_processing_upload(
+                file, settings
+            )
+            try:
+                expected = processing_output_size(info, outscale)
+                settings.admit_upscale_processing(info.width, info.height)
+                settings.admit_processing_output_dimensions(*expected)
+            except BaseException:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise
+            request: dict[str, object] = {
+                "task_type": "upscale",
+                "model": model,
+                "outscale": outscale,
+                "tile": tile,
+                "source_image_name": source_name,
+                "source_image_sha256": source_hash,
+                "source_identity_sha256": source_hash,
+                "requested_width": info.width,
+                "requested_height": info.height,
+                "expected_width": expected[0],
+                "expected_height": expected[1],
+                "expected_mode": "RGB",
+            }
+            try:
+                task = store.admit(idempotency_key, request, "upscale")
+            except IdempotencyConflict as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(409, "idempotency key conflicts with another request") from exc
+            except QueueFull as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(503, "task queue is full") from exc
+            except Exception:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise
+            if task.status in {"succeeded", "failed"}:
+                _remove_orphan_source(settings.source_dir, source_name, store)
+        return _safe_processing_task(task)
+
+    @app.post("/v1/background-removal-tasks", status_code=202)
+    async def admit_background_removal_task(
+        file: Annotated[UploadFile, File()],
+        model: Annotated[
+            Literal["bria-rmbg-2.0", "birefnet-hr-matting"],
+            Query(),
+        ],
+        idempotency_key: Annotated[str, Header(alias="Idempotency-Key")],
+        alpha_blur: Annotated[float, Query(ge=0, le=20)] = 0,
+        alpha_erode: Annotated[int, Query(ge=0, le=100)] = 0,
+        alpha_dilate: Annotated[int, Query(ge=0, le=100)] = 0,
+        alpha_threshold: Annotated[int, Query(ge=0, le=255)] = 0,
+        birefnet_inference_size: Annotated[int, Query(ge=512, le=4096)] = 2048,
+        birefnet_foreground_refinement: bool = False,
+        model_input_size: Annotated[int, Query(ge=512, le=2048)] = 1024,
+        despill_enabled: bool = False,
+        despill_color: Annotated[
+            Literal["black", "white", "green", "blue", "custom"], Query()
+        ] = "black",
+        despill_hex_color: Annotated[str, Query(pattern="^[0-9A-Fa-f]{6}$")] = "000000",
+    ) -> dict[str, object]:
+        if not IDEMPOTENCY_PATTERN.fullmatch(idempotency_key):
+            await file.close()
+            raise HTTPException(422, "invalid idempotency key")
+        with _ADMISSION_LOCK, source_file_lock(settings.source_dir):
+            source_name, source_hash, info, source_existed = await _persist_processing_upload(
+                file, settings
+            )
+            try:
+                settings.admit_processing_output_dimensions(info.width, info.height)
+            except BaseException:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise
+            request = {
+                "task_type": "background-removal",
+                "model": model,
+                "alpha_blur": alpha_blur,
+                "alpha_erode": alpha_erode,
+                "alpha_dilate": alpha_dilate,
+                "alpha_threshold": alpha_threshold,
+                "birefnet_inference_size": birefnet_inference_size,
+                "birefnet_foreground_refinement": birefnet_foreground_refinement,
+                "model_input_size": model_input_size,
+                "despill_enabled": despill_enabled,
+                "despill_color": despill_color,
+                "despill_hex_color": despill_hex_color.lower(),
+                "source_image_name": source_name,
+                "source_image_sha256": source_hash,
+                "source_identity_sha256": source_hash,
+                "requested_width": info.width,
+                "requested_height": info.height,
+                "expected_width": info.width,
+                "expected_height": info.height,
+                "expected_mode": "RGBA",
+            }
+            try:
+                task = store.admit(idempotency_key, request, "background-removal")
+            except IdempotencyConflict as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(409, "idempotency key conflicts with another request") from exc
+            except QueueFull as exc:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise HTTPException(503, "task queue is full") from exc
+            except Exception:
+                if not source_existed:
+                    _remove_orphan_source(settings.source_dir, source_name, store)
+                raise
+            if task.status in {"succeeded", "failed"}:
+                _remove_orphan_source(settings.source_dir, source_name, store)
+        return _safe_processing_task(task)
+
+    def processing_task(task_id: str, capability: TaskKind) -> TaskRecord:
+        if not TASK_ID_PATTERN.fullmatch(task_id):
+            raise HTTPException(404, "task not found")
+        try:
+            task = store.get(task_id)
+        except KeyError as exc:
+            raise HTTPException(404, "task not found") from exc
+        if task.task_kind != capability:
+            raise HTTPException(404, "task not found")
+        return task
+
+    def processing_image(task_id: str, capability: TaskKind) -> FileResponse:
+        task = processing_task(task_id, capability)
+        if task.status != "succeeded" or task.image_name != f"{task_id}.png":
+            raise HTTPException(409, "processing result is not available")
+        assert task.image_name is not None
+        path = settings.output_dir / task.image_name
+        try:
+            output_hash, info = validate_processing_output(path, task, settings)
+            if (
+                output_hash != task.output_sha256
+                or info.width != task.output_width
+                or info.height != task.output_height
+                or info.mode != task.output_mode
+            ):
+                raise ValueError("processing output metadata mismatch")
+        except Exception as exc:
+            logger.error(
+                "processing result validation failed: capability=%s task_id=%s",
+                capability,
+                task_id,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+            raise HTTPException(503, "processing result is unavailable") from exc
+        return FileResponse(path, media_type="image/png", filename=task.image_name)
+
+    @app.get("/v1/upscale-tasks/{task_id}")
+    def upscale_task_status(task_id: str) -> dict[str, object]:
+        return _safe_processing_task(processing_task(task_id, "upscale"))
+
+    @app.get("/v1/upscale-tasks/{task_id}/image")
+    def upscale_task_image(task_id: str) -> FileResponse:
+        return processing_image(task_id, "upscale")
+
+    @app.get("/v1/background-removal-tasks/{task_id}")
+    def background_task_status(task_id: str) -> dict[str, object]:
+        return _safe_processing_task(processing_task(task_id, "background-removal"))
+
+    @app.get("/v1/background-removal-tasks/{task_id}/image")
+    def background_task_image(task_id: str) -> FileResponse:
+        return processing_image(task_id, "background-removal")
 
     @app.post("/v1/upscale", response_class=Response)
     async def upscale(
@@ -746,7 +1010,7 @@ def create_app(
             task = store.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "task not found") from exc
-        if task.request.get("task_type") != "image-edit":
+        if task.task_kind != "generation" or task.request.get("task_type") != "image-edit":
             raise HTTPException(404, "task not found")
         return _safe_task(task)
 
@@ -758,7 +1022,7 @@ def create_app(
             task = store.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "task not found") from exc
-        if task.request.get("task_type") != "image-edit":
+        if task.task_kind != "generation" or task.request.get("task_type") != "image-edit":
             raise HTTPException(404, "task not found")
         image_name = task.image_name
         if task.status != "succeeded" or image_name != f"{task_id}.png":
@@ -800,7 +1064,7 @@ def create_app(
             task = store.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "task not found") from exc
-        if task.request.get("task_type") == "image-edit":
+        if task.task_kind != "generation" or task.request.get("task_type") == "image-edit":
             raise HTTPException(404, "task not found")
         return _safe_task(task)
 
@@ -812,7 +1076,7 @@ def create_app(
             task = store.get(task_id)
         except KeyError as exc:
             raise HTTPException(404, "task not found") from exc
-        if task.request.get("task_type") == "image-edit":
+        if task.task_kind != "generation" or task.request.get("task_type") == "image-edit":
             raise HTTPException(404, "task not found")
         if task.status != "succeeded" or task.image_name != f"{task_id}.png":
             raise HTTPException(409, "generation image is not available")

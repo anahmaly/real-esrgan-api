@@ -7,14 +7,20 @@ import io
 import logging
 import os
 import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, AsyncIterator, Literal
 
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from PIL import Image
 
 from image_api.images import validate_dimensions
+from image_api.config import Settings
+from image_api.lane import GpuLane
+from image_api.processing import ProcessingRunner, recover_processing_tasks
+from image_api.store import TaskStore
 from image_api.workers import PeerEvictor
 from image_api_workers.execution import execute_in_gpu_lane
 from image_api_workers.uploads import read_bounded_upload
@@ -107,6 +113,9 @@ def _run_background(
     birefnet_inference_size: int,
     birefnet_foreground_refinement: bool,
     model_input_size: int,
+    despill_enabled: bool = False,
+    despill_color: str = "black",
+    despill_hex_color: str = "000000",
 ) -> bytes:
     global _active_model
     if not 512 <= birefnet_inference_size <= 4096:
@@ -151,7 +160,11 @@ def _run_background(
             dilate=alpha_dilate,
             threshold=alpha_threshold,
         ),
-        despill=DespillOptions(),
+        despill=DespillOptions(
+            enabled=despill_enabled,
+            color=despill_color,
+            hex_color=despill_hex_color,
+        ),
         background_color="transparent",
         background_hex="ffffff",
         return_alpha=False,
@@ -197,9 +210,6 @@ def _health() -> dict[str, object]:
     }
 
 
-app = FastAPI(title="image-api-background-worker", docs_url=None, redoc_url=None)
-
-
 def _shutdown_unload() -> None:
     try:
         _release_resident_models()
@@ -208,6 +218,112 @@ def _shutdown_unload() -> None:
 
 
 atexit.register(_shutdown_unload)
+
+
+def start_durable_runner() -> None:
+    if os.getenv("IMAGE_API_ENABLE_PROCESSING_RUNNER", "false").lower() != "true":
+        return
+    settings = Settings.from_env()
+    store = TaskStore(settings.database_path, settings.max_queue_depth)
+    recovered = recover_processing_tasks(
+        "background-removal", store, settings.output_dir, settings.source_dir, settings
+    )
+    if recovered:
+        logger.warning("reconciled interrupted background tasks: count=%s", recovered)
+
+    def model(source: Path, request: dict[str, object]) -> bytes:
+        with source.open("rb") as handle:
+            data = handle.read(settings.processing_max_upload_bytes + 1)
+        if len(data) > settings.processing_max_upload_bytes:
+            raise ValueError("persisted source exceeds configured limit")
+        model_name = request.get("model")
+        alpha_blur = request.get("alpha_blur")
+        alpha_erode = request.get("alpha_erode")
+        alpha_dilate = request.get("alpha_dilate")
+        alpha_threshold = request.get("alpha_threshold")
+        inference_size = request.get("birefnet_inference_size")
+        refinement = request.get("birefnet_foreground_refinement")
+        model_input_size = request.get("model_input_size")
+        despill_enabled = request.get("despill_enabled")
+        despill_color = request.get("despill_color")
+        despill_hex_color = request.get("despill_hex_color")
+        if (
+            model_name not in {"bria-rmbg-2.0", "birefnet-hr-matting"}
+            or not isinstance(model_name, str)
+            or not isinstance(alpha_blur, (int, float))
+            or isinstance(alpha_blur, bool)
+            or any(
+                type(value) is not int
+                for value in (
+                    alpha_erode,
+                    alpha_dilate,
+                    alpha_threshold,
+                    inference_size,
+                    model_input_size,
+                )
+            )
+            or type(refinement) is not bool
+            or type(despill_enabled) is not bool
+            or despill_color not in {"black", "white", "green", "blue", "custom"}
+            or not isinstance(despill_color, str)
+            or not isinstance(despill_hex_color, str)
+        ):
+            raise ValueError("invalid persisted background-removal parameters")
+        assert type(alpha_erode) is int
+        assert type(alpha_dilate) is int
+        assert type(alpha_threshold) is int
+        assert type(inference_size) is int
+        assert type(model_input_size) is int
+        assert type(refinement) is bool
+        assert type(despill_enabled) is bool
+        with _model_lock:
+            return _run_background(
+                data,
+                model=model_name,
+                alpha_blur=float(alpha_blur),
+                alpha_erode=alpha_erode,
+                alpha_dilate=alpha_dilate,
+                alpha_threshold=alpha_threshold,
+                birefnet_inference_size=inference_size,
+                birefnet_foreground_refinement=refinement,
+                model_input_size=model_input_size,
+                despill_enabled=despill_enabled,
+                despill_color=despill_color,
+                despill_hex_color=despill_hex_color,
+            )
+
+    runner = ProcessingRunner(
+        "background-removal",
+        store,
+        GpuLane(settings.gpu_lane_path, settings.lane_timeout_seconds),
+        settings.source_dir,
+        settings.output_dir,
+        model,
+        settings,
+        peer_evictor=PeerEvictor(
+            (
+                os.getenv("IMAGE_API_UPSCALE_WORKER_URL", "http://upscale-worker:9001"),
+                os.getenv("IMAGE_API_GENERATION_WORKER_URL", "http://generation-worker:9003"),
+            )
+        ),
+    )
+
+    def loop() -> None:
+        poll = float(os.getenv("IMAGE_API_PROCESSING_POLL_SECONDS", "0.5"))
+        while True:
+            if not runner.run_one():
+                time.sleep(poll)
+
+    threading.Thread(target=loop, name="background-task-runner", daemon=True).start()
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    start_durable_runner()
+    yield
+
+
+app = FastAPI(title="image-api-background-worker", docs_url=None, redoc_url=None, lifespan=lifespan)
 
 
 @app.get("/health")

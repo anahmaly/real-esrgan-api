@@ -24,7 +24,9 @@ PeerEvictor = Callable[[], None]
 GENERATION_MAX_ENCODED_BYTES = 100_000_000
 GENERATION_OUTPUT_MODE = "RGB"
 SOURCE_NAME_PATTERN = re.compile(r"[0-9a-f]{64}-[0-9a-f]{64}\.png")
-SOURCE_TEMP_PATTERN = re.compile(r"\.[0-9a-f]{64}-[0-9a-f]{64}\.png\.[0-9a-f]{32}\.tmp")
+SOURCE_TEMP_PATTERN = re.compile(
+    r"(?:\.[0-9a-f]{64}-[0-9a-f]{64}\.png\.[0-9a-f]{32}|\.processing-upload\.[0-9a-f]{32})\.tmp"
+)
 SOURCE_LOCK_NAME = ".source-files.lock"
 
 
@@ -220,7 +222,7 @@ def recover_interrupted_tasks(
     store: TaskStore, output_dir: Path, source_dir: Path | None = None
 ) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
-    running = store.running()
+    running = store.running("generation")
     for task in running:
         reconcile_task_output(store, task.task_id, output_dir, source_dir)
     if source_dir is not None:
