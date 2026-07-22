@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 STATE_UID = 10001
 STATE_GID = 10001
 DEFAULT_MAX_ENTRIES = 100_000
+DEFAULT_MAX_DEPTH = 32
 SOURCE_LOCK_NAME = ".source-files.lock"
 STATE_INIT_LOCK_NAME = ".state-init.lock"
 READINESS_FILE_PREFIX = ".write-readiness."
@@ -61,23 +62,28 @@ def _open_verified_entry(
     return fd
 
 
-def _state_entries(root_fd: int, root: Path, max_entries: int) -> Iterator[_StateEntry]:
+def _state_entries(
+    root_fd: int,
+    root: Path,
+    max_entries: int,
+    max_depth: int,
+) -> Iterator[_StateEntry]:
     root_metadata = os.fstat(root_fd)
     root_device = root_metadata.st_dev
     root_entry = _StateEntry(root, os.dup(root_fd), root_metadata)
-    stack: list[tuple[_StateEntry, Any]] = []
+    stack: list[tuple[_StateEntry, Any, int]] = []
     unstacked_fd: int | None = root_entry.fd
     seen = 1
     try:
         yield root_entry
         if stat.S_ISDIR(root_entry.metadata.st_mode):
-            stack.append((root_entry, os.scandir(root_entry.fd)))
+            stack.append((root_entry, os.scandir(root_entry.fd), 0))
             unstacked_fd = None
         else:
             os.close(root_entry.fd)
             unstacked_fd = None
         while stack:
-            parent, directory_entries = stack[-1]
+            parent, directory_entries, parent_depth = stack[-1]
             try:
                 directory_entry = next(directory_entries)
             except StopIteration:
@@ -100,6 +106,9 @@ def _state_entries(root_fd: int, root: Path, max_entries: int) -> Iterator[_Stat
                 continue
             if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
                 continue
+            child_depth = parent_depth + 1
+            if stat.S_ISDIR(metadata.st_mode) and child_depth > max_depth:
+                raise StateMigrationLimit("state migration depth limit exceeded")
             child_fd = _open_verified_entry(
                 directory_entry.name,
                 parent_fd=parent.fd,
@@ -111,7 +120,7 @@ def _state_entries(root_fd: int, root: Path, max_entries: int) -> Iterator[_Stat
             unstacked_fd = child_fd
             yield child
             if stat.S_ISDIR(metadata.st_mode):
-                stack.append((child, os.scandir(child_fd)))
+                stack.append((child, os.scandir(child_fd), child_depth))
                 unstacked_fd = None
             else:
                 os.close(child_fd)
@@ -119,7 +128,7 @@ def _state_entries(root_fd: int, root: Path, max_entries: int) -> Iterator[_Stat
     finally:
         if unstacked_fd is not None:
             os.close(unstacked_fd)
-        for entry, directory_entries in reversed(stack):
+        for entry, directory_entries, _depth in reversed(stack):
             directory_entries.close()
             os.close(entry.fd)
 
@@ -134,10 +143,13 @@ def initialize_state(
     uid: int = STATE_UID,
     gid: int = STATE_GID,
     max_entries: int = DEFAULT_MAX_ENTRIES,
+    max_depth: int = DEFAULT_MAX_DEPTH,
 ) -> None:
-    """Bound ownership migration without following links or crossing the state volume."""
+    """Preflight and migrate a quiescent state volume within explicit resource bounds."""
     if max_entries < 1:
         raise ValueError("state migration entry limit must be positive")
+    if max_depth < 1:
+        raise ValueError("state migration depth limit must be positive")
     state_dir.mkdir(parents=True, exist_ok=True)
     root_fd = _open_directory(state_dir)
     lock_fd = -1
@@ -152,7 +164,9 @@ def initialize_state(
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RuntimeError("state migration is already running") from exc
-        for entry in _state_entries(root_fd, state_dir, max_entries):
+        for _entry in _state_entries(root_fd, state_dir, max_entries, max_depth):
+            pass
+        for entry in _state_entries(root_fd, state_dir, max_entries, max_depth):
             os.fchown(entry.fd, uid, gid)
             if stat.S_ISDIR(entry.metadata.st_mode):
                 os.fchmod(entry.fd, entry.metadata.st_mode | stat.S_IRWXU)
@@ -260,6 +274,7 @@ def main() -> None:
             max_entries=int(
                 os.getenv("IMAGE_API_STATE_INIT_MAX_ENTRIES", str(DEFAULT_MAX_ENTRIES))
             ),
+            max_depth=int(os.getenv("IMAGE_API_STATE_INIT_MAX_DEPTH", str(DEFAULT_MAX_DEPTH))),
         )
         return
     if not state_write_ready(state, state / "tasks.sqlite3", state / "sources"):

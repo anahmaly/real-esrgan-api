@@ -54,6 +54,78 @@ def test_state_migration_is_bounded(tmp_path: Path, monkeypatch) -> None:
         initialize_state(state, uid=10001, gid=10001, max_entries=2)
 
 
+def test_state_migration_rejects_excess_depth_before_metadata_mutation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state = tmp_path / "state"
+    (state / "one" / "two" / "three").mkdir(parents=True)
+    mutations: list[str] = []
+    monkeypatch.setattr(os, "fchown", lambda *_args: mutations.append("chown"))
+    monkeypatch.setattr(os, "fchmod", lambda *_args: mutations.append("chmod"))
+
+    with pytest.raises(StateMigrationLimit, match="depth limit exceeded"):
+        initialize_state(state, uid=10001, gid=10001, max_entries=100, max_depth=2)
+
+    assert mutations == []
+
+
+def test_state_migration_within_depth_bound_is_complete_and_closes_descriptors(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state = tmp_path / "state"
+    leaf = state / "one" / "two" / "payload"
+    leaf.parent.mkdir(parents=True)
+    leaf.write_bytes(b"legacy")
+    real_scandir = state_module.os.scandir
+    active_iterators = 0
+    peak_iterators = 0
+    migrated: list[Path] = []
+    migrated_fds: set[int] = set()
+
+    class TrackingScandir:
+        def __init__(self, fd: int) -> None:
+            nonlocal active_iterators, peak_iterators
+            self._iterator = real_scandir(fd)
+            self._closed = False
+            active_iterators += 1
+            peak_iterators = max(peak_iterators, active_iterators)
+
+        def __next__(self) -> os.DirEntry[str]:
+            return next(self._iterator)
+
+        def close(self) -> None:
+            nonlocal active_iterators
+            if not self._closed:
+                self._iterator.close()
+                self._closed = True
+                active_iterators -= 1
+
+    def tracking_scandir(fd: int) -> TrackingScandir:
+        return TrackingScandir(fd)
+
+    def record_fchown(fd: int, _uid: int, _gid: int) -> None:
+        migrated.append(Path(os.readlink(f"/proc/self/fd/{fd}")))
+        migrated_fds.add(fd)
+
+    monkeypatch.setattr(state_module.os, "scandir", tracking_scandir)
+    monkeypatch.setattr(state_module.os, "fchown", record_fchown)
+    monkeypatch.setattr(state_module.os, "fchmod", lambda *_args: None)
+
+    initialize_state(state, uid=10001, gid=10001, max_entries=100, max_depth=2)
+
+    assert {state, state / ".state-init.lock", state / "one", leaf.parent, leaf} == set(migrated)
+    assert peak_iterators == 3
+    assert active_iterators == 0
+    for fd in migrated_fds:
+        with pytest.raises(OSError):
+            os.fstat(fd)
+
+
+def test_state_migration_depth_limit_must_be_positive(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="depth limit must be positive"):
+        initialize_state(tmp_path / "state", max_depth=0)
+
+
 def test_state_migration_does_not_scan_a_different_device_directory(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -192,6 +264,7 @@ def test_compose_uses_bounded_root_init_and_waits_before_every_shared_writer() -
     assert 'user: "0:0"' in compose
     assert "python -m image_api.state init" in compose
     assert "IMAGE_API_STATE_INIT_MAX_ENTRIES" in compose
+    assert "IMAGE_API_STATE_INIT_MAX_DEPTH" in compose
     for service in SERVICES:
         match = re.search(rf"(?ms)^  {re.escape(service)}:\n(?P<body>.*?)(?=^  \S|\Z)", compose)
         assert match is not None

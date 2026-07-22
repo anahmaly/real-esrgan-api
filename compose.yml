@@ -13,6 +13,7 @@ services:
       IMAGE_API_STATE_UID: "10001"
       IMAGE_API_STATE_GID: "10001"
       IMAGE_API_STATE_INIT_MAX_ENTRIES: ${IMAGE_API_STATE_INIT_MAX_ENTRIES:-100000}
+      IMAGE_API_STATE_INIT_MAX_DEPTH: ${IMAGE_API_STATE_INIT_MAX_DEPTH:-32}
     volumes:
       - image-api-state:/state
     restart: "no"
